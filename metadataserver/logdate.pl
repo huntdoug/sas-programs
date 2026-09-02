@@ -26,7 +26,7 @@ use warnings;
 use Getopt::Long qw(GetOptions);
 use Time::Local qw(timegm);
 
-our $VERSION = '2.2.1';
+our $VERSION = '2.2.2';
 
 # Verbose is the default.
 my $verbose = 1;

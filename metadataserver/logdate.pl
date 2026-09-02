@@ -149,10 +149,12 @@ Detection rule:
   TRACE is only considered enabled when the sampled log window contains more
   TRACE+DEBUG records than INFO records.
 
-  In other words:
-      signal = TRACE + DEBUG
-      noise  = INFO
-      active = (signal > 0) and (signal > noise)
+  Ratio = (TRACE + DEBUG) / INFO
+
+  Examples:
+    ratio = 2.50  => TRACE+DEBUG is 2.5x more common than INFO
+    ratio = 1.00  => equal amounts; TRACE is borderline and not strongly active
+    ratio = 0.50  => INFO is more common; not TRACE-enabled
 
   If INFO dominates the sampled window, the script reports the log as not
   TRACE-enabled even if isolated TRACE lines are present.
@@ -588,12 +590,12 @@ sub print_compact
 {
     my @items = @_;
 
-    printf "%-10s %-12s %-12s %-12s %-6s %-1s %-1s %-1s %-5s %s\n",
+    printf "%-10s %-12s %-12s %-12s %-10s %-1s %-1s %-1s %-5s %s\n",
         'DATE',
         'BEGIN',
         'END',
         'DUR',
-        'RATIO',
+        'RATIO(T+D/I)',
         'T',
         'S',
         'R',
@@ -636,7 +638,7 @@ sub print_compact
         my $ratio = $row->{trace_ratio} || 0;
         my $cluster = cluster_code($row->{cluster});
 
-        printf "%-10s %-12s %-12s %-12s %-6.2f %-1s %-1s %-1s %-5s %s",
+        printf "%-10s %-12s %-12s %-12s %-10.2f %-1s %-1s %-1s %-5s %s",
             $display_date,
             $begin_time || 'N/A',
             $display_end,
@@ -668,12 +670,12 @@ sub print_verbose
 {
     my @items = @_;
 
-    printf "%-10s %-12s %-22s %-15s %-6s %-5s %-7s %-7s %-5s %s\n",
+    printf "%-10s %-12s %-22s %-15s %-10s %-5s %-7s %-7s %-5s %s\n",
         'DATE',
         'BEGIN',
         'END',
         'DURATION',
-        'RATIO',
+        'RATIO(T+D/I)',
         'TRACE',
         'STARTUP',
         'RUNNING',
@@ -707,7 +709,7 @@ sub print_verbose
         my $ratio = $row->{trace_ratio} || 0;
         my $cluster = cluster_code($row->{cluster});
 
-        printf "%-10s %-12s %-22s %-15s %-6.2f %-5s %-7s %-7s %-5s %s",
+        printf "%-10s %-12s %-22s %-15s %-10.2f %-5s %-7s %-7s %-5s %s",
             $display_date,
             $begin_time || 'N/A',
             $display_end,
@@ -753,6 +755,7 @@ sub print_details_summary
 
     print "\nTRACE determination summary\n";
     print "Rule: TRACE is enabled only when TRACE + DEBUG > INFO in the sampled log window.\n";
+    print "Ratio = (TRACE + DEBUG) / INFO. >1.0 means TRACE/DEBUG dominates; <=1.0 means INFO dominates.\n";
     print "Files analyzed: $total_files\n";
     print "TRACE-enabled logs: $trace_enabled\n";
     print "Not TRACE-enabled: $non_trace\n";

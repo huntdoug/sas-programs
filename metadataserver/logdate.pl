@@ -36,7 +36,7 @@ use warnings;
 use Getopt::Long qw(GetOptions);
 use Time::Local qw(timegm);
 
-our $VERSION = '2.2.7';
+our $VERSION = '2.2.8';
 
 # Details is the default. Use --compact to suppress the detailed report.
 my $details = 1;
@@ -272,10 +272,10 @@ sub analyze_file
             $row{cluster} = 'TERTIARY';
         }
         elsif ($sample =~ /Cluster\s+_NoCluster_/i) {
-            $row{cluster} = 'NO_CLUSTER';
+            $row{cluster} = '-';
         }
         elsif ($sample =~ /\bcluster\b/i) {
-            $row{cluster} = 'CLUSTERED';
+            $row{cluster} = '-';
         }
         else {
             $row{cluster} = classify_cluster($sample);
@@ -514,23 +514,35 @@ sub short_time
     return $time;
 }
 
+sub normalize_host
+{
+    my ($host) = @_;
+    return '' unless defined $host;
+    $host =~ s/^['"]//;
+    $host =~ s/['"]$//;
+    $host =~ s/\s+$//;
+    $host = lc($host);
+    $host =~ s/\..*$//;
+    return $host;
+}
+
 sub classify_cluster
 {
     my ($sample) = @_;
-    return 'NC' unless defined $sample && length $sample;
+    return '-' unless defined $sample && length $sample;
 
     my $local_host = '';
     if ($sample =~ /Host:\s*'([^']+)'/i) {
-        $local_host = $1;
+        $local_host = normalize_host($1);
     }
 
     my $self_redirect = 0;
     my $remote_redirect = 0;
 
     while ($sample =~ /redirect(?:ing)?[^\n]{0,200}?\bto\s+([A-Za-z0-9._-]+)/ig) {
-        my $target = $1;
+        my $target = normalize_host($1);
         next unless length $target;
-        if (length $local_host && lc($target) eq lc($local_host)) {
+        if (length $local_host && $target eq $local_host) {
             $self_redirect = 1;
         }
         else {
@@ -555,18 +567,14 @@ sub classify_cluster
     }
 
     if ($sample =~ /Cluster\s+_NoCluster_/i) {
-        return 'NC';
+        return '-';
     }
 
     if ($sample =~ /\bcluster\b/i) {
-        return 'CL';
+        return '-';
     }
 
-    if (length $local_host) {
-        return 'NC';
-    }
-
-    return 'NC';
+    return '-';
 }
 
 sub cluster_code
@@ -576,12 +584,12 @@ sub cluster_code
     return 'PRI' if defined $cluster && $cluster =~ /^PRIMARY$/i;
     return '2'   if defined $cluster && $cluster =~ /^SECONDARY$/i;
     return '3'   if defined $cluster && $cluster =~ /^TERTIARY$/i;
-    return 'NC'  if defined $cluster && $cluster =~ /^NO_CLUSTER$/i;
+    return '-'   if defined $cluster && $cluster =~ /^(?:NO_CLUSTER|-|UNKNOWN|SINGLE)$/i;
     return 'CL'  if defined $cluster && $cluster =~ /^CLUSTERED$/i;
     return 'PRI' if defined $cluster && $cluster =~ /^PRI$/i;
     return '2'   if defined $cluster && $cluster =~ /^2$/i;
     return '3'   if defined $cluster && $cluster =~ /^3$/i;
-    return 'NC'  if defined $cluster && $cluster =~ /^NC$/i;
+    return '-'   if defined $cluster && $cluster =~ /^-$/i;
     return 'CL'  if defined $cluster && $cluster =~ /^CL$/i;
     return '-';
 }

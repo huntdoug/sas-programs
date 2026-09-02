@@ -36,7 +36,7 @@ use warnings;
 use Getopt::Long qw(GetOptions);
 use Time::Local qw(timegm);
 
-our $VERSION = '2.2.5';
+our $VERSION = '2.2.6';
 
 # Details is the default. Use --compact to suppress the detailed report.
 my $details = 1;
@@ -513,11 +513,11 @@ sub cluster_code
 {
     my ($cluster) = @_;
 
-    return 'P' if defined $cluster && $cluster =~ /^PRIMARY$/i;
-    return 'S' if defined $cluster && $cluster =~ /^SECONDARY$/i;
-    return '3' if defined $cluster && $cluster =~ /^TERTIARY$/i;
-    return 'N' if defined $cluster && $cluster =~ /^NO_CLUSTER$/i;
-    return 'C' if defined $cluster && $cluster =~ /^CLUSTERED$/i;
+    return 'PRI' if defined $cluster && $cluster =~ /^PRIMARY$/i;
+    return '2'   if defined $cluster && $cluster =~ /^SECONDARY$/i;
+    return '3'   if defined $cluster && $cluster =~ /^TERTIARY$/i;
+    return 'NC'  if defined $cluster && $cluster =~ /^NO_CLUSTER$/i;
+    return 'CL'  if defined $cluster && $cluster =~ /^CLUSTERED$/i;
     return '-';
 }
 
@@ -525,7 +525,7 @@ sub print_compact
 {
     my @items = @_;
 
-    printf "%-10s %-12s %-12s %-12s %-6s %-1s %-1s %-1s %-2s %s\n",
+    printf "%-10s %-12s %-12s %-12s %-6s %-1s %-1s %-1s %-5s %s\n",
         'DATE',
         'BEGIN',
         'END',
@@ -534,7 +534,7 @@ sub print_compact
         'T',
         'S',
         'R',
-        'CL',
+        'CLUSTER',
         'FILE';
 
     my $previous_date = '';
@@ -573,7 +573,7 @@ sub print_compact
         my $ratio = $row->{trace_ratio} || 0;
         my $cluster = cluster_code($row->{cluster});
 
-        printf "%-10s %-12s %-12s %-12s %-6.2f %-1s %-1s %-1s %-2s %s",
+        printf "%-10s %-12s %-12s %-12s %-6.2f %-1s %-1s %-1s %-5s %s",
             $display_date,
             $begin_time || 'N/A',
             $display_end,
@@ -605,7 +605,7 @@ sub print_verbose
 {
     my @items = @_;
 
-    printf "%-10s %-12s %-22s %-15s %-6s %-5s %-7s %-7s %-2s %s\n",
+    printf "%-10s %-12s %-22s %-15s %-6s %-5s %-7s %-7s %-5s %s\n",
         'DATE',
         'BEGIN',
         'END',
@@ -614,7 +614,7 @@ sub print_verbose
         'TRACE',
         'STARTUP',
         'RUNNING',
-        'CL',
+        'CLUSTER',
         'FILE';
 
     my $previous_date = '';
@@ -644,7 +644,7 @@ sub print_verbose
         my $ratio = $row->{trace_ratio} || 0;
         my $cluster = cluster_code($row->{cluster});
 
-        printf "%-10s %-12s %-22s %-15s %-6.2f %-5s %-7s %-7s %-2s %s",
+        printf "%-10s %-12s %-22s %-15s %-6.2f %-5s %-7s %-7s %-5s %s",
             $display_date,
             $begin_time || 'N/A',
             $display_end,
@@ -699,10 +699,11 @@ sub print_details_summary
         my $ratio = $row->{trace_ratio} || 0;
         my $status = $row->{trace} ? 'TRACE_ENABLED' : 'NOT_TRACE_ENABLED';
         my $cluster = $row->{cluster} || 'UNKNOWN';
+        my $cluster_code = cluster_code($cluster);
         printf "%-40s %-18s cluster=%-10s trace=%d debug=%d info=%d ratio=%.2f\n",
             $row->{file},
             $status,
-            $cluster,
+            $cluster_code,
             $row->{trace_count} || 0,
             $row->{debug_count} || 0,
             $row->{info_count} || 0,

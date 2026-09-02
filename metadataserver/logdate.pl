@@ -36,7 +36,7 @@ use warnings;
 use Getopt::Long qw(GetOptions);
 use Time::Local qw(timegm);
 
-our $VERSION = '2.2.11';
+our $VERSION = '2.2.12';
 
 # Details is the default. Use --compact to suppress the detailed report.
 my $details = 1;
@@ -492,6 +492,9 @@ sub classify_cluster
     if ($sample =~ /Host:\s*'([^']+)'/i) {
         $local_host = normalize_host($1);
     }
+    elsif ($sample =~ /SASMeta_MetadataServer_[0-9T-]+_([A-Z0-9]+)_/i) {
+        $local_host = lc($1);
+    }
 
     my @redirect_targets;
     while ($sample =~ /redirect(?:ing)?[^\n]{0,200}?\bat\s+([A-Za-z0-9._-]+)/ig) {
@@ -501,34 +504,25 @@ sub classify_cluster
     }
 
     if (@redirect_targets) {
-        my $saw_self = 0;
-        my $saw_other = 0;
         for my $target (@redirect_targets) {
-            if (length $local_host && $target eq $local_host) {
-                $saw_self = 1;
-            }
-            else {
-                $saw_other = 1;
+            if (length $local_host && $target ne $local_host) {
+                return 'PRI';
             }
         }
-        return 'NO' if $saw_self && !$saw_other;
-        return 'PRI' if $saw_other;
+        return 'NO';
     }
 
-    if ($sample =~ /(?:Setting the master|Changing the master|the master node|master node)/i) {
+    if ($sample =~ /\b(?:Setting the master|Changing the master|the master node|master node)\b/i) {
         return 'PRI';
     }
 
-    if ($sample =~ /(?:\bmaster\b.*\bsecondary\b|\bsecondary\b.*\bmaster\b|\bsecondary\b.*\bnode\b|\bslave\b.*\bnode\b|\bstandby\b.*\bnode\b|\bbackup\b.*\bnode\b)/i) {
+    if ($sample =~ /\b(?:master|primary)\b.*\b(?:secondary|standby|backup|slave)\b/i ||
+        $sample =~ /\b(?:secondary|standby|backup|slave)\b.*\b(?:master|primary)\b/i) {
         return '2';
     }
 
-    if ($sample =~ /(?:\bthird\b.*\bnode\b|\btertiary\b.*\bnode\b|\b3rd\s+node\b|\bnode\s+3\b)/i) {
+    if ($sample =~ /\b(?:third|tertiary|3rd\s+node|node\s+3)\b/i) {
         return '3';
-    }
-
-    if ($sample =~ /Cluster\s+_NoCluster_/i) {
-        return 'NO';
     }
 
     return 'NO';

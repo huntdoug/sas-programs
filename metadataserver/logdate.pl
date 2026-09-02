@@ -36,7 +36,7 @@ use warnings;
 use Getopt::Long qw(GetOptions);
 use Time::Local qw(timegm);
 
-our $VERSION = '2.2.3';
+our $VERSION = '2.2.4';
 
 # Details is the default. Use --compact to suppress the detailed report.
 my $details = 1;
@@ -496,11 +496,12 @@ sub print_compact
 {
     my @items = @_;
 
-    printf "%-10s %-12s %-12s %-12s %-1s %-1s %-1s %s\n",
+    printf "%-10s %-12s %-12s %-12s %-6s %-1s %-1s %-1s %s\n",
         'DATE',
         'BEGIN',
         'END',
         'DUR',
+        'RATIO',
         'T',
         'S',
         'R',
@@ -528,27 +529,27 @@ sub print_compact
         $previous_date = $begin_date
             if $begin_date ne '';
 
-        my $display_end =
-            $end_time || 'N/A';
+        my $display_end = $end_time || 'N/A';
 
+        # Retain END date only when the file crosses to another date.
         if (
             $end_date ne ''
             && $begin_date ne ''
             && $end_date ne $begin_date
         ) {
-            $display_end =
-                $end_date
-                . 'T'
-                . $end_time;
+            $display_end = $end_date . 'T' . $end_time;
         }
 
-        printf "%-10s %-12s %-12s %-12s %-1s %-1s %-1s %s",
+        my $ratio = $row->{trace_ratio} || 0;
+
+        printf "%-10s %-12s %-12s %-12s %-6.2f %-1s %-1s %-1s %s",
             $display_date,
-            ($begin_time || 'N/A'),
+            $begin_time || 'N/A',
             $display_end,
             format_duration_verbose(
                 $row->{duration_ms}
             ),
+            $ratio,
             $row->{trace}
                 ? 'Y'
                 : '-',
@@ -568,16 +569,16 @@ sub print_compact
     }
 }
 
-
 sub print_verbose
 {
     my @items = @_;
 
-    printf "%-10s %-12s %-22s %-15s %-5s %-7s %-7s %s\n",
+    printf "%-10s %-12s %-22s %-15s %-6s %-5s %-7s %-7s %s\n",
         'DATE',
         'BEGIN',
         'END',
         'DURATION',
+        'RATIO',
         'TRACE',
         'STARTUP',
         'RUNNING',
@@ -607,11 +608,14 @@ sub print_verbose
             $display_end = $end_date . 'T' . $end_time;
         }
 
-        printf "%-10s %-12s %-22s %-15s %-5s %-7s %-7s %s",
+        my $ratio = $row->{trace_ratio} || 0;
+
+        printf "%-10s %-12s %-22s %-15s %-6.2f %-5s %-7s %-7s %s",
             $display_date,
             $begin_time || 'N/A',
             $display_end,
             format_duration_verbose($row->{duration_ms}),
+            $ratio,
             $row->{trace} ? 'YES' : 'NO',
             $row->{startup} ? 'YES' : 'NO',
             $row->{running} ? 'YES' : 'NO',

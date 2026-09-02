@@ -36,7 +36,7 @@ use warnings;
 use Getopt::Long qw(GetOptions);
 use Time::Local qw(timegm);
 
-our $VERSION = '2.2.4';
+our $VERSION = '2.2.5';
 
 # Details is the default. Use --compact to suppress the detailed report.
 my $details = 1;
@@ -185,6 +185,7 @@ Flags in the detailed output:
   T / TRACE     TRACE+DEBUG exceeds INFO in the sampled window
   S / STARTUP   SAH011001I State, starting found
   R / RUNNING   SAH011999I State, running found
+  CL / CLUSTER   P = PRIMARY, S = SECONDARY, 3 = TERTIARY, N = NO_CLUSTER
 
 Status values:
   OK             Normal analysis
@@ -216,6 +217,7 @@ sub analyze_file
         debug_count => 0,
         info_count  => 0,
         trace_ratio => 0,
+        cluster     => 'UNKNOWN',
         startup     => 0,
         running     => 0,
         status      => 'OK',
@@ -256,8 +258,23 @@ sub analyze_file
         $row{debug_count} = $debug_count;
         $row{info_count}  = $info_count;
         $row{trace_ratio} = $signal / ($noise + 1);
-
         $row{trace} = ($signal > 0 && $signal > $noise) ? 1 : 0;
+
+        if ($sample =~ /\b(?:master|primary)\b/i) {
+            $row{cluster} = 'PRIMARY';
+        }
+        elsif ($sample =~ /\b(?:slave|secondary|backup|standby)\b/i) {
+            $row{cluster} = 'SECONDARY';
+        }
+        elsif ($sample =~ /\b(?:third|tertiary|node\s*3|3rd\s+node)\b/i) {
+            $row{cluster} = 'TERTIARY';
+        }
+        elsif ($sample =~ /Cluster\s+_NoCluster_/i) {
+            $row{cluster} = 'NO_CLUSTER';
+        }
+        elsif ($sample =~ /\bcluster\b/i) {
+            $row{cluster} = 'CLUSTERED';
+        }
 
         $row{startup} =
             $sample =~ /\bSAH011001I\b.*?\bState,\s*starting\b/i
@@ -492,11 +509,23 @@ sub short_time
     return $time;
 }
 
+sub cluster_code
+{
+    my ($cluster) = @_;
+
+    return 'P' if defined $cluster && $cluster =~ /^PRIMARY$/i;
+    return 'S' if defined $cluster && $cluster =~ /^SECONDARY$/i;
+    return '3' if defined $cluster && $cluster =~ /^TERTIARY$/i;
+    return 'N' if defined $cluster && $cluster =~ /^NO_CLUSTER$/i;
+    return 'C' if defined $cluster && $cluster =~ /^CLUSTERED$/i;
+    return '-';
+}
+
 sub print_compact
 {
     my @items = @_;
 
-    printf "%-10s %-12s %-12s %-12s %-6s %-1s %-1s %-1s %s\n",
+    printf "%-10s %-12s %-12s %-12s %-6s %-1s %-1s %-1s %-2s %s\n",
         'DATE',
         'BEGIN',
         'END',
@@ -505,6 +534,7 @@ sub print_compact
         'T',
         'S',
         'R',
+        'CL',
         'FILE';
 
     my $previous_date = '';
@@ -541,8 +571,9 @@ sub print_compact
         }
 
         my $ratio = $row->{trace_ratio} || 0;
+        my $cluster = cluster_code($row->{cluster});
 
-        printf "%-10s %-12s %-12s %-12s %-6.2f %-1s %-1s %-1s %s",
+        printf "%-10s %-12s %-12s %-12s %-6.2f %-1s %-1s %-1s %-2s %s",
             $display_date,
             $begin_time || 'N/A',
             $display_end,
@@ -559,6 +590,7 @@ sub print_compact
             $row->{running}
                 ? 'Y'
                 : '-',
+            $cluster,
             $row->{file};
 
         if ($row->{status} ne 'OK') {
@@ -573,7 +605,7 @@ sub print_verbose
 {
     my @items = @_;
 
-    printf "%-10s %-12s %-22s %-15s %-6s %-5s %-7s %-7s %s\n",
+    printf "%-10s %-12s %-22s %-15s %-6s %-5s %-7s %-7s %-2s %s\n",
         'DATE',
         'BEGIN',
         'END',
@@ -582,6 +614,7 @@ sub print_verbose
         'TRACE',
         'STARTUP',
         'RUNNING',
+        'CL',
         'FILE';
 
     my $previous_date = '';
@@ -609,8 +642,9 @@ sub print_verbose
         }
 
         my $ratio = $row->{trace_ratio} || 0;
+        my $cluster = cluster_code($row->{cluster});
 
-        printf "%-10s %-12s %-22s %-15s %-6.2f %-5s %-7s %-7s %s",
+        printf "%-10s %-12s %-22s %-15s %-6.2f %-5s %-7s %-7s %-2s %s",
             $display_date,
             $begin_time || 'N/A',
             $display_end,
@@ -619,6 +653,7 @@ sub print_verbose
             $row->{trace} ? 'YES' : 'NO',
             $row->{startup} ? 'YES' : 'NO',
             $row->{running} ? 'YES' : 'NO',
+            $cluster,
             $row->{file};
 
         if ($row->{status} ne 'OK') {
@@ -663,9 +698,11 @@ sub print_details_summary
     for my $row (@items) {
         my $ratio = $row->{trace_ratio} || 0;
         my $status = $row->{trace} ? 'TRACE_ENABLED' : 'NOT_TRACE_ENABLED';
-        printf "%-40s %-18s trace=%d debug=%d info=%d ratio=%.2f\n",
+        my $cluster = $row->{cluster} || 'UNKNOWN';
+        printf "%-40s %-18s cluster=%-10s trace=%d debug=%d info=%d ratio=%.2f\n",
             $row->{file},
             $status,
+            $cluster,
             $row->{trace_count} || 0,
             $row->{debug_count} || 0,
             $row->{info_count} || 0,

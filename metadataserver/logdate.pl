@@ -36,7 +36,7 @@ use warnings;
 use Getopt::Long qw(GetOptions);
 use Time::Local qw(timegm);
 
-our $VERSION = '2.2.10';
+our $VERSION = '2.2.11';
 
 # Details is the default. Use --compact to suppress the detailed report.
 my $details = 1;
@@ -497,7 +497,6 @@ sub normalize_host
     $host =~ s/\s+$//;
     $host = lc($host);
     $host =~ s/\..*$//;
-    $host =~ s/.*_// if $host =~ /_\w+$/;
     return $host;
 }
 
@@ -510,61 +509,42 @@ sub classify_cluster
     if ($sample =~ /Host:\s*'([^']+)'/i) {
         $local_host = normalize_host($1);
     }
-    elsif ($sample =~ /([A-Z][A-Z0-9]+_\d{8}_[A-Z0-9]+)\.log/i) {
-        my $from_name = $1;
-        $from_name =~ s/^.*_//;
-        $from_name =~ s/_[0-9]{8}.*$//;
-        $local_host = lc($from_name);
-    }
 
-    my $self_redirect = 0;
-    my $remote_redirect = 0;
-
+    my @redirect_targets;
     while ($sample =~ /redirect(?:ing)?[^\n]{0,200}?\bat\s+([A-Za-z0-9._-]+)/ig) {
         my $target = normalize_host($1);
         next unless length $target;
-        if (length $local_host && $target eq $local_host) {
-            $self_redirect = 1;
-        }
-        else {
-            $remote_redirect = 1;
-        }
+        push @redirect_targets, $target;
     }
 
-    if (!$remote_redirect) {
-        while ($sample =~ /redirect(?:ing)?[^\n]{0,200}?\bto\s+(?!server\b)([A-Za-z0-9._-]+)/ig) {
-            my $target = normalize_host($1);
-            next unless length $target;
+    if (@redirect_targets) {
+        my $saw_self = 0;
+        my $saw_other = 0;
+        for my $target (@redirect_targets) {
             if (length $local_host && $target eq $local_host) {
-                $self_redirect = 1;
+                $saw_self = 1;
             }
             else {
-                $remote_redirect = 1;
+                $saw_other = 1;
             }
         }
-    }
-
-    if ($remote_redirect) {
-        return 'PRI';
+        return 'NO' if $saw_self && !$saw_other;
+        return 'PRI' if $saw_other;
     }
 
     if ($sample =~ /(?:Setting the master|Changing the master|the master node|master node)/i) {
         return 'PRI';
     }
 
-    if ($sample =~ /(?:secondary|slave|standby|backup)/i) {
+    if ($sample =~ /(?:\bmaster\b.*\bsecondary\b|\bsecondary\b.*\bmaster\b|\bsecondary\b.*\bnode\b|\bslave\b.*\bnode\b|\bstandby\b.*\bnode\b|\bbackup\b.*\bnode\b)/i) {
         return '2';
     }
 
-    if ($sample =~ /(?:third|tertiary|3rd node|node 3)/i) {
+    if ($sample =~ /(?:\bthird\b.*\bnode\b|\btertiary\b.*\bnode\b|\b3rd\s+node\b|\bnode\s+3\b)/i) {
         return '3';
     }
 
     if ($sample =~ /Cluster\s+_NoCluster_/i) {
-        return 'NO';
-    }
-
-    if ($sample =~ /\bcluster\b/i) {
         return 'NO';
     }
 
@@ -578,7 +558,7 @@ sub cluster_code
     return 'PRI' if defined $cluster && $cluster =~ /^PRIMARY$/i;
     return '2'   if defined $cluster && $cluster =~ /^SECONDARY$/i;
     return '3'   if defined $cluster && $cluster =~ /^TERTIARY$/i;
-    return 'NO'  if defined $cluster && $cluster =~ /^(?:NO_CLUSTER|NO|UNKNOWN|SINGLE|-)$/i;
+    return 'NO'  if defined $cluster && $cluster =~ /^(?:NO_CLUSTER|NO|UNKNOWN|SINGLE|-|NULL)$/i;
     return 'CL'  if defined $cluster && $cluster =~ /^CLUSTERED$/i;
     return 'PRI' if defined $cluster && $cluster =~ /^PRI$/i;
     return '2'   if defined $cluster && $cluster =~ /^2$/i;

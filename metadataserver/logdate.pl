@@ -36,7 +36,7 @@ use warnings;
 use Getopt::Long qw(GetOptions);
 use Time::Local qw(timegm);
 
-our $VERSION = '2.2.6';
+our $VERSION = '2.2.7';
 
 # Details is the default. Use --compact to suppress the detailed report.
 my $details = 1;
@@ -275,6 +275,9 @@ sub analyze_file
         elsif ($sample =~ /\bcluster\b/i) {
             $row{cluster} = 'CLUSTERED';
         }
+        else {
+            $row{cluster} = classify_cluster($sample);
+        }
 
         $row{startup} =
             $sample =~ /\bSAH011001I\b.*?\bState,\s*starting\b/i
@@ -509,6 +512,61 @@ sub short_time
     return $time;
 }
 
+sub classify_cluster
+{
+    my ($sample) = @_;
+    return 'NC' unless defined $sample && length $sample;
+
+    my $local_host = '';
+    if ($sample =~ /Host:\s*'([^']+)'/i) {
+        $local_host = $1;
+    }
+
+    my $self_redirect = 0;
+    my $remote_redirect = 0;
+
+    while ($sample =~ /redirect(?:ing)?[^\n]{0,200}?\bto\s+([A-Za-z0-9._-]+)/ig) {
+        my $target = $1;
+        next unless length $target;
+        if (length $local_host && lc($target) eq lc($local_host)) {
+            $self_redirect = 1;
+        }
+        else {
+            $remote_redirect = 1;
+        }
+    }
+
+    if ($remote_redirect) {
+        return 'PRI';
+    }
+
+    if ($sample =~ /(?:Setting the master|Changing the master|the master node|master node)/i) {
+        return 'PRI';
+    }
+
+    if ($sample =~ /(?:secondary|slave|standby|backup)/i) {
+        return '2';
+    }
+
+    if ($sample =~ /(?:third|tertiary|3rd node|node 3)/i) {
+        return '3';
+    }
+
+    if ($sample =~ /Cluster\s+_NoCluster_/i) {
+        return 'NC';
+    }
+
+    if ($sample =~ /\bcluster\b/i) {
+        return 'CL';
+    }
+
+    if (length $local_host) {
+        return 'NC';
+    }
+
+    return 'NC';
+}
+
 sub cluster_code
 {
     my ($cluster) = @_;
@@ -518,6 +576,11 @@ sub cluster_code
     return '3'   if defined $cluster && $cluster =~ /^TERTIARY$/i;
     return 'NC'  if defined $cluster && $cluster =~ /^NO_CLUSTER$/i;
     return 'CL'  if defined $cluster && $cluster =~ /^CLUSTERED$/i;
+    return 'PRI' if defined $cluster && $cluster =~ /^PRI$/i;
+    return '2'   if defined $cluster && $cluster =~ /^2$/i;
+    return '3'   if defined $cluster && $cluster =~ /^3$/i;
+    return 'NC'  if defined $cluster && $cluster =~ /^NC$/i;
+    return 'CL'  if defined $cluster && $cluster =~ /^CL$/i;
     return '-';
 }
 

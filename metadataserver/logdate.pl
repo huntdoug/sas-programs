@@ -36,7 +36,7 @@ use warnings;
 use Getopt::Long qw(GetOptions);
 use Time::Local qw(timegm);
 
-our $VERSION = '2.2.12';
+our $VERSION = '2.2.13';
 
 # Details is the default. Use --compact to suppress the detailed report.
 my $details = 1;
@@ -84,6 +84,9 @@ my $TIMESTAMP_RE = qr{
     )
 }mx;
 
+print "logdate $VERSION\n";
+print "\n";
+
 my %seen;
 my @rows;
 
@@ -105,6 +108,23 @@ usage(1, 'no readable log files supplied') unless @rows;
     || ($a->{end}   // '9999') cmp ($b->{end}   // '9999')
     || $a->{file} cmp $b->{file}
 } @rows;
+
+# Print hostname diagnostics for verification.
+print "=== Hostname Analysis ===\n";
+for my $row (@rows) {
+    print "File: $row->{file}\n";
+    if ($row->{header_host}) {
+        print "  Header Host: $row->{header_host}  ->  $row->{norm_header}\n";
+    }
+    if ($row->{name_host}) {
+        print "  Filename Host: $row->{name_host}  ->  $row->{norm_name}\n";
+    }
+    if ($row->{redirect_hosts}) {
+        print "  Redirect Target(s): $row->{redirect_hosts}  ->  $row->{norm_redirects}\n";
+    }
+    print "  Classification: $row->{cluster}\n";
+    print "\n";
+}
 
 if ($details) {
     print_details_summary(@rows);
@@ -194,6 +214,12 @@ sub analyze_file
         info_count  => 0,
         trace_ratio => 0,
         cluster     => 'UNKNOWN',
+        header_host => '',
+        name_host   => '',
+        redirect_hosts => '',
+        norm_header => '',
+        norm_name   => '',
+        norm_redirects => '',
         startup     => 0,
         running     => 0,
         status      => 'OK',
@@ -222,6 +248,28 @@ sub analyze_file
 
     if ($sample_size > 0 && defined sysseek($fh, 0, 0)) {
         my $sample = read_exact($fh, $sample_size);
+
+        if ($sample =~ /Host:\s*'([^']+)'/i) {
+            $row{header_host} = $1;
+            $row{norm_header} = normalize_host($1);
+        }
+
+        if ($file =~ /SASMeta_MetadataServer_[0-9T-]+_([A-Z0-9]+)_/i) {
+            $row{name_host} = $1;
+            $row{norm_name} = lc(normalize_host($1));
+        }
+
+        my @redirect_targets;
+        while ($sample =~ /redirect(?:ing)?[^\n]{0,200}?\bat\s+([A-Za-z0-9._-]+)/ig) {
+            my $target = $1;
+            next unless length $target;
+            push @redirect_targets, $target;
+        }
+
+        if (@redirect_targets) {
+            $row{redirect_hosts} = join(', ', @redirect_targets);
+            $row{norm_redirects} = join(', ', map { normalize_host($_) } @redirect_targets);
+        }
 
         my $trace_count = () = $sample =~ /^\d{4}-.*?\bTRACE\b/mg;
         my $debug_count = () = $sample =~ /^\d{4}-.*?\bDEBUG\b/mg;

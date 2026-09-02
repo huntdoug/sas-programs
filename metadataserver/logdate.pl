@@ -236,24 +236,7 @@ sub analyze_file
         $row{trace_ratio} = $signal / ($noise + 1);
         $row{trace} = ($signal > 0 && $signal > $noise) ? 1 : 0;
 
-        if ($sample =~ /\b(?:master|primary)\b/i) {
-            $row{cluster} = 'PRIMARY';
-        }
-        elsif ($sample =~ /\b(?:slave|secondary|backup|standby)\b/i) {
-            $row{cluster} = 'SECONDARY';
-        }
-        elsif ($sample =~ /\b(?:third|tertiary|node\s*3|3rd\s+node)\b/i) {
-            $row{cluster} = 'TERTIARY';
-        }
-        elsif ($sample =~ /Cluster\s+_NoCluster_/i) {
-            $row{cluster} = 'NO';
-        }
-        elsif ($sample =~ /\bcluster\b/i) {
-            $row{cluster} = 'NO';
-        }
-        else {
-            $row{cluster} = classify_cluster($sample);
-        }
+        $row{cluster} = classify_cluster($sample);
 
         $row{startup} =
             $sample =~ /\bSAH011001I\b.*?\bState,\s*starting\b/i

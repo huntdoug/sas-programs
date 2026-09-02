@@ -7,46 +7,19 @@
 # Author: Douglas Hunt (SAS domain expertise)
 # Developed with GitHub Copilot assistance
 #
-# Verbose output is the default. Use -c for compact output.
-#
-# Usage:
-#   logdate [options] LOGFILE...
-#   logdate -d SASMeta*.log
-#   logdate -c SASMeta*.log
-#   logdate --version
-#
-# The program reads SAS Metadata Server log files, finds the first and last
-# timestamps, and summarizes whether the log appears to be in a TRACE-enabled
-# state. TRACE is considered enabled only when the sampled log window contains
-# more TRACE+DEBUG records than INFO records.
-#
-# This is a heuristic used to discriminate meaningful diagnostic logging from
-# a log that is mostly informational chatter.
-#
-# The script is intentionally conservative: a log with INFO dominating the
-# sampled window is treated as not TRACE-enabled even if a few TRACE records
-# appear.
-#
-# Author: Douglas Hunt (SAS domain expertise)
-# Developed with GitHub Copilot assistance
-#
 use strict;
 use warnings;
 
 use Getopt::Long qw(GetOptions);
 use Time::Local qw(timegm);
 
-our $VERSION = '2.2.13';
+our $VERSION = '2.2.18';
 
-# Details is the default. Use --compact to suppress the detailed report.
 my $details = 1;
 my $help = 0;
 my $version = 0;
 
-# Filesystem block used when looking for first and last timestamps.
 my $block_size = 1024 * 1024;
-
-# Initial bytes examined for TRACE, STARTUP, and RUNNING markers.
 my $marker_bytes = 4 * 1024 * 1024;
 
 GetOptions(
@@ -73,7 +46,6 @@ die "logdate: --block-size must be at least 4096\n"
 die "logdate: --marker-bytes must be at least 4096\n"
     if $marker_bytes < 4096;
 
-# SAS timestamp at the start of a physical line.
 my $TIMESTAMP_RE = qr{
     ^
     (
@@ -84,46 +56,34 @@ my $TIMESTAMP_RE = qr{
     )
 }mx;
 
-print "logdate $VERSION\n";
-print "\n";
+print "logdate $VERSION\n\n";
 
 my %seen;
 my @rows;
 
-# Remove duplicate filenames while retaining command-line order.
 for my $file (grep { !$seen{$_}++ } @ARGV) {
     if (!-f $file) {
         warn "logdate: warning: not a regular file: $file\n";
         next;
     }
-
     push @rows, analyze_file($file);
 }
 
 usage(1, 'no readable log files supplied') unless @rows;
 
-# Sort by BEGIN, then END, then filename.
 @rows = sort {
        ($a->{begin} // '9999') cmp ($b->{begin} // '9999')
     || ($a->{end}   // '9999') cmp ($b->{end}   // '9999')
     || $a->{file} cmp $b->{file}
 } @rows;
 
-# Print hostname diagnostics for verification.
 print "=== Hostname Analysis ===\n";
 for my $row (@rows) {
     print "File: $row->{file}\n";
-    if ($row->{header_host}) {
-        print "  Header Host: $row->{header_host}  ->  $row->{norm_header}\n";
-    }
-    if ($row->{name_host}) {
-        print "  Filename Host: $row->{name_host}  ->  $row->{norm_name}\n";
-    }
-    if ($row->{redirect_hosts}) {
-        print "  Redirect Target(s): $row->{redirect_hosts}  ->  $row->{norm_redirects}\n";
-    }
-    print "  Classification: $row->{cluster}\n";
-    print "\n";
+    print "  Header Host: $row->{header_host}  ->  $row->{norm_header}\n" if $row->{header_host};
+    print "  Filename Host: $row->{name_host}  ->  $row->{norm_name}\n" if $row->{name_host};
+    print "  Redirect Target(s): $row->{redirect_hosts}  ->  $row->{norm_redirects}\n" if $row->{redirect_hosts};
+    print "  Classification: $row->{cluster}\n\n";
 }
 
 if ($details) {
@@ -136,12 +96,9 @@ else {
 
 exit 0;
 
-sub usage
-{
+sub usage {
     my ($status, $message) = @_;
-
     warn "logdate: $message\n" if defined $message;
-
     my $fh = $status ? *STDERR : *STDOUT;
 
     print $fh <<'USAGE';
@@ -153,96 +110,50 @@ Usage:
   logdate -d file1.log file2.log
   logdate -c SASMeta*.log
   logdate --version
-
-Purpose:
-  This utility inspects one or more SAS Metadata Server log files and reports
-  the first and last timestamp, elapsed duration, startup state, running state,
-  and whether the sampled log window suggests TRACE or DEBUG activity is active.
-
-  The file name and the first log line normally include the hostname. The script
-  normalizes that hostname to its short lowercase form so it can compare it with
-  the target hostname found in cluster redirect messages.
-
-  If the target hostname matches the current node after normalization, the
-  redirect is self-directed and simply means this is a single metadata server,
-  not a clustered node. If the redirect target is different, that is strong
-  evidence this node is acting as the primary/master metadata server.
-
-  The cluster column therefore reports:
-    PRI = primary/master
-    2   = secondary
-    3   = tertiary
-    NO  = no cluster / single metadata server
-
-  6. If there is no cluster marker and no remote redirect, the node is treated
-     as a single metadata server and shown as 'NO'.
-
-Flags in the detailed output:
-  T / TRACE     TRACE+DEBUG exceeds INFO in the sampled window
-  S / STARTUP   SAH011001I State, starting found
-  R / RUNNING   SAH011999I State, running found
-  CLUSTER       PRI = primary/master, 2 = secondary, 3 = tertiary, NO = no cluster
-
-Status values:
-  OK             Normal analysis
-  NO_BEGIN       No usable begin timestamp found
-  NO_END         No usable end timestamp found
-  END_BEFORE_BEGIN  End timestamp precedes the begin timestamp
-  BAD_TIMESTAMP  Invalid or unparsable timestamp format
-  OPEN_ERROR     File could not be opened
-  STAT_ERROR     File size/stat failure
-
-The detailed view prints the per-file decision using the rule above and also
-includes the count of TRACE, DEBUG, and INFO records observed in the sample.
 USAGE
-
     exit $status;
 }
 
-sub analyze_file
-{
+sub analyze_file {
     my ($file) = @_;
 
     my %row = (
-        file        => $file,
-        begin       => undef,
-        end         => undef,
-        duration_ms => undef,
-        trace       => 0,
-        trace_count => 0,
-        debug_count => 0,
-        info_count  => 0,
-        trace_ratio => 0,
-        cluster     => 'UNKNOWN',
-        header_host => '',
-        name_host   => '',
+        file           => $file,
+        begin          => undef,
+        end            => undef,
+        duration_ms    => undef,
+        trace          => 0,
+        trace_count    => 0,
+        debug_count    => 0,
+        info_count     => 0,
+        trace_ratio    => 0,
+        cluster        => 'UNKNOWN',
+        header_host    => '',
+        name_host      => '',
         redirect_hosts => '',
-        norm_header => '',
-        norm_name   => '',
+        norm_header    => '',
+        norm_name      => '',
         norm_redirects => '',
-        startup     => 0,
-        running     => 0,
-        status      => 'OK',
+        startup        => 0,
+        running        => 0,
+        status         => 'OK',
     );
 
     my $size = -s $file;
-
     if (!defined $size) {
         $row{status} = 'STAT_ERROR';
         return \%row;
     }
 
     my $fh;
-
     if (!open($fh, '<', $file)) {
         $row{status} = "OPEN_ERROR: $!";
         return \%row;
     }
-
     binmode($fh);
 
     $row{begin} = find_begin($fh, $size);
-    $row{end} = find_end($fh, $size);
+    $row{end}   = find_end($fh, $size);
 
     my $sample_size = $size < $marker_bytes ? $size : $marker_bytes;
 
@@ -259,11 +170,13 @@ sub analyze_file
             $row{norm_name} = lc(normalize_host($1));
         }
 
+        my %seen_redirect;
         my @redirect_targets;
         while ($sample =~ /redirect(?:ing)?[^\n]{0,200}?\bat\s+([A-Za-z0-9._-]+)/ig) {
             my $target = $1;
             next unless length $target;
-            push @redirect_targets, $target;
+            my $norm = normalize_host($target);
+            push @redirect_targets, $target unless $seen_redirect{$norm}++;
         }
 
         if (@redirect_targets) {
@@ -282,33 +195,19 @@ sub analyze_file
         $row{debug_count} = $debug_count;
         $row{info_count}  = $info_count;
         $row{trace_ratio} = $signal / ($noise + 1);
-        $row{trace} = ($signal > 0 && $signal > $noise) ? 1 : 0;
+        $row{trace}       = ($signal > 0 && $signal > $noise) ? 1 : 0;
+        $row{cluster}     = classify_cluster($sample);
 
-        $row{cluster} = classify_cluster($sample);
-
-        $row{startup} =
-            $sample =~ /\bSAH011001I\b.*?\bState,\s*starting\b/i
-            ? 1 : 0;
-
-        $row{running} =
-            $sample =~ /\bSAH011999I\b.*?\bState,\s*running\b/i
-            ? 1 : 0;
+        $row{startup} = ($sample =~ /\bSAH011001I\b.*?\bState,\s*starting\b/i) ? 1 : 0;
+        $row{running} = ($sample =~ /\bSAH011999I\b.*?\bState,\s*running\b/i) ? 1 : 0;
     }
 
     close($fh);
 
-    if (!defined $row{begin}) {
-        $row{status} = 'NO_BEGIN';
-        return \%row;
-    }
-
-    if (!defined $row{end}) {
-        $row{status} = 'NO_END';
-        return \%row;
-    }
+    return \%row unless defined $row{begin} && defined $row{end};
 
     my $begin_ms = timestamp_ms($row{begin});
-    my $end_ms = timestamp_ms($row{end});
+    my $end_ms   = timestamp_ms($row{end});
 
     if (!defined $begin_ms || !defined $end_ms) {
         $row{status} = 'BAD_TIMESTAMP';
@@ -316,74 +215,48 @@ sub analyze_file
     }
 
     $row{duration_ms} = $end_ms - $begin_ms;
-
-    if ($row{duration_ms} < 0) {
-        $row{status} = 'END_BEFORE_BEGIN';
-    }
+    $row{status} = 'END_BEFORE_BEGIN' if $row{duration_ms} < 0;
 
     return \%row;
 }
 
-sub read_exact
-{
+sub read_exact {
     my ($fh, $length) = @_;
-
     my $buffer = '';
     my $offset = 0;
 
     while ($offset < $length) {
-        my $count = sysread(
-            $fh,
-            $buffer,
-            $length - $offset,
-            $offset
-        );
-
-        last if !defined $count;
-        last if $count == 0;
-
+        my $count = sysread($fh, $buffer, $length - $offset, $offset);
+        last if !defined $count || $count == 0;
         $offset += $count;
     }
-
     return $buffer;
 }
 
-sub find_begin
-{
+sub find_begin {
     my ($fh, $size) = @_;
-
     my $offset = 0;
     my $carry = '';
 
     while ($offset < $size) {
         my $remaining = $size - $offset;
-        my $length =
-            $remaining < $block_size ? $remaining : $block_size;
+        my $length = $remaining < $block_size ? $remaining : $block_size;
 
         return undef unless defined sysseek($fh, $offset, 0);
-
         my $block = read_exact($fh, $length);
         last if $block eq '';
 
         my $data = $carry . $block;
+        return $1 if $data =~ /$TIMESTAMP_RE/;
 
-        if ($data =~ /$TIMESTAMP_RE/) {
-            return $1;
-        }
-
-        $carry =
-            length($data) > 128 ? substr($data, -128) : $data;
-
+        $carry = length($data) > 128 ? substr($data, -128) : $data;
         $offset += length($block);
     }
-
     return undef;
 }
 
-sub find_end
-{
+sub find_end {
     my ($fh, $size) = @_;
-
     my $offset = $size;
     my $carry = '';
 
@@ -392,147 +265,69 @@ sub find_end
         my $start = $offset - $length;
 
         return undef unless defined sysseek($fh, $start, 0);
-
         my $block = read_exact($fh, $length);
         last if $block eq '';
 
         my $data = $block . $carry;
         my @timestamps = ($data =~ /$TIMESTAMP_RE/g);
+        return $timestamps[-1] if @timestamps;
 
-        if (@timestamps) {
-            return $timestamps[-1];
-        }
-
-        $carry =
-            length($data) > 128 ? substr($data, 0, 128) : $data;
-
+        $carry = length($data) > 128 ? substr($data, 0, 128) : $data;
         $offset = $start;
     }
-
     return undef;
 }
 
-sub timestamp_ms
-{
+sub timestamp_ms {
     my ($timestamp) = @_;
-
-    return undef unless defined $timestamp;
-
-    return undef unless $timestamp =~ m{
-        ^
-        (\d{4})-(\d{2})-(\d{2})
-        T
-        (\d{2}):(\d{2}):(\d{2})
-        ,
-        (\d{3})
-        $
+    return undef unless defined $timestamp && $timestamp =~ m{
+        ^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2}),(\d{3})$
     }x;
 
-    my ($year, $month, $day, $hour, $minute, $second, $millisecond) =
-        ($1, $2, $3, $4, $5, $6, $7);
-
     my $epoch;
-
     eval {
-        $epoch = timegm(
-            $second,
-            $minute,
-            $hour,
-            $day,
-            $month - 1,
-            $year
-        );
+        $epoch = timegm($6, $5, $4, $3, $2 - 1, $1);
     };
-
     return undef if $@;
-
-    return $epoch * 1000 + $millisecond;
+    return $epoch * 1000 + $7;
 }
 
-sub format_duration_compact
-{
+sub format_duration_verbose {
     my ($milliseconds) = @_;
-
-    return 'N/A' unless defined $milliseconds;
-    return 'INVALID' if $milliseconds < 0;
-
-    my $total_minutes = int($milliseconds / 60000);
-    my $hours = int($total_minutes / 60);
-    my $minutes = $total_minutes % 60;
-
-    return sprintf('%02d:%02d', $hours, $minutes);
-}
-
-sub format_duration_verbose
-{
-    my ($milliseconds) = @_;
-
     return 'N/A' unless defined $milliseconds;
     return 'END<BEGIN' if $milliseconds < 0;
 
     my $days = int($milliseconds / 86400000);
     $milliseconds %= 86400000;
-
     my $hours = int($milliseconds / 3600000);
     $milliseconds %= 3600000;
-
     my $minutes = int($milliseconds / 60000);
     $milliseconds %= 60000;
-
     my $seconds = int($milliseconds / 1000);
     my $millis = $milliseconds % 1000;
 
-    my $clock = sprintf(
-        '%02d:%02d:%02d.%03d',
-        $hours,
-        $minutes,
-        $seconds,
-        $millis
-    );
-
+    my $clock = sprintf('%02d:%02d:%02d.%03d', $hours, $minutes, $seconds, $millis);
     return $days ? "$days+$clock" : $clock;
 }
 
-sub split_timestamp
-{
+sub split_timestamp {
     my ($timestamp) = @_;
-
     return ('', '') unless defined $timestamp;
-
-    if ($timestamp =~ /^(\d{4}-\d{2}-\d{2})T(.+)$/) {
-        return ($1, $2);
-    }
-
+    return $1 eq '' ? ('', $timestamp) : ($1, $2) if $timestamp =~ /^(\d{4}-\d{2}-\d{2})T(.+)$/;
     return ('', $timestamp);
 }
 
-sub short_time
-{
-    my ($time) = @_;
-
-    return 'N/A' unless defined $time && length $time;
-
-    if ($time =~ /^(\d{2}:\d{2})/) {
-        return $1;
-    }
-
-    return $time;
-}
-
-sub normalize_host
-{
+sub normalize_host {
     my ($host) = @_;
     return '' unless defined $host;
-    $host =~ s/^['"]//;
-    $host =~ s/['"]$//;
+    $host =~ s/^['"]|['"]$//g;
     $host =~ s/\s+$//;
     $host = lc($host);
     $host =~ s/\..*$//;
     return $host;
 }
 
-sub classify_cluster
-{
+sub classify_cluster {
     my ($sample) = @_;
     return 'NO' unless defined $sample && length $sample;
 
@@ -544,244 +339,123 @@ sub classify_cluster
         $local_host = lc($1);
     }
 
+    my %seen_redirect;
     my @redirect_targets;
     while ($sample =~ /redirect(?:ing)?[^\n]{0,200}?\bat\s+([A-Za-z0-9._-]+)/ig) {
         my $target = normalize_host($1);
         next unless length $target;
-        push @redirect_targets, $target;
+        push @redirect_targets, $target unless $seen_redirect{$target}++;
     }
 
-    if (@redirect_targets) {
-        for my $target (@redirect_targets) {
-            if (length $local_host && $target ne $local_host) {
-                return 'PRI';
-            }
-        }
-        return 'NO';
-    }
+    return 'PRI' if grep { length $local_host && $_ ne $local_host } @redirect_targets;
+    return 'NO' if @redirect_targets;
 
-    if ($sample =~ /\b(?:Setting the master|Changing the master|the master node|master node)\b/i) {
-        return 'PRI';
-    }
-
-    if ($sample =~ /\b(?:master|primary)\b.*\b(?:secondary|standby|backup|slave)\b/i ||
-        $sample =~ /\b(?:secondary|standby|backup|slave)\b.*\b(?:master|primary)\b/i) {
-        return '2';
-    }
-
-    if ($sample =~ /\b(?:third|tertiary|3rd\s+node|node\s+3)\b/i) {
-        return '3';
-    }
+    return 'PRI' if $sample =~ /\b(?:Setting the master|Changing the master|the master node|master node)\b/i;
+    return '2'   if $sample =~ /\b(?:master|primary)\b.*\b(?:secondary|standby|backup|slave)\b/i ||
+                    $sample =~ /\b(?:secondary|standby|backup|slave)\b.*\b(?:master|primary)\b/i;
+    return '3'   if $sample =~ /\b(?:third|tertiary|3rd\s+node|node\s+3)\b/i;
 
     return 'NO';
 }
 
-sub cluster_code
-{
+sub cluster_code {
     my ($cluster) = @_;
-
-    return 'PRI' if defined $cluster && $cluster =~ /^PRIMARY$/i;
-    return '2'   if defined $cluster && $cluster =~ /^SECONDARY$/i;
-    return '3'   if defined $cluster && $cluster =~ /^TERTIARY$/i;
-    return 'NO'  if defined $cluster && $cluster =~ /^(?:NO_CLUSTER|NO|UNKNOWN|SINGLE|-|NULL)$/i;
+    return 'PRI' if defined $cluster && $cluster =~ /^(?:PRIMARY|PRI)$/i;
+    return '2'   if defined $cluster && $cluster =~ /^(?:SECONDARY|2)$/i;
+    return '3'   if defined $cluster && $cluster =~ /^(?:TERTIARY|3)$/i;
     return 'CL'  if defined $cluster && $cluster =~ /^CLUSTERED$/i;
-    return 'PRI' if defined $cluster && $cluster =~ /^PRI$/i;
-    return '2'   if defined $cluster && $cluster =~ /^2$/i;
-    return '3'   if defined $cluster && $cluster =~ /^3$/i;
-    return 'NO'  if defined $cluster && $cluster =~ /^NO$/i;
-    return 'CL'  if defined $cluster && $cluster =~ /^CL$/i;
     return 'NO';
 }
 
-sub print_compact
-{
+sub print_compact {
     my @items = @_;
-
-    printf "%-10s %-12s %-12s %-12s %-10s %-1s %-1s %-1s %-5s %s\n",
-        'DATE',
-        'BEGIN',
-        'END',
-        'DUR',
-        'RATIO(T+D/I)',
-        'T',
-        'S',
-        'R',
-        'CLUSTER',
-        'FILE';
+    printf "%-10s %-12s %-23s %-12s %-13s %-1s %-1s %-1s %-7s %s\n",
+        'DATE', 'BEGIN', 'END', 'DUR', 'RATIO(T+D/I)', 'T', 'S', 'R', 'CLUSTER', 'FILE';
 
     my $previous_date = '';
-
-    for my $row (@items) {
-
-        my ($begin_date, $begin_time) =
-            split_timestamp($row->{begin});
-
-        my ($end_date, $end_time) =
-            split_timestamp($row->{end});
-
-        my $display_date = '';
-
-        if (
-            $begin_date ne ''
-            && $begin_date ne $previous_date
-        ) {
-            $display_date = $begin_date;
-        }
-
-        $previous_date = $begin_date
-            if $begin_date ne '';
-
-        my $display_end = $end_time || 'N/A';
-
-        # Retain END date only when the file crosses to another date.
-        if (
-            $end_date ne ''
-            && $begin_date ne ''
-            && $end_date ne $begin_date
-        ) {
-            $display_end = $end_date . 'T' . $end_time;
-        }
-
-        my $ratio = $row->{trace_ratio} || 0;
-        my $cluster = cluster_code($row->{cluster});
-
-        printf "%-10s %-12s %-12s %-12s %-10.2f %-1s %-1s %-1s %-5s %s",
-            $display_date,
-            $begin_time || 'N/A',
-            $display_end,
-            format_duration_verbose(
-                $row->{duration_ms}
-            ),
-            $ratio,
-            $row->{trace}
-                ? 'Y'
-                : '-',
-            $row->{startup}
-                ? 'Y'
-                : '-',
-            $row->{running}
-                ? 'Y'
-                : '-',
-            $cluster,
-            $row->{file};
-
-        if ($row->{status} ne 'OK') {
-            print " [$row->{status}]";
-        }
-
-        print "\n";
-    }
-}
-
-sub print_verbose
-{
-    my @items = @_;
-
-    printf "%-10s %-12s %-22s %-15s %-10s %-5s %-7s %-7s %-5s %s\n",
-        'DATE',
-        'BEGIN',
-        'END',
-        'DURATION',
-        'RATIO(T+D/I)',
-        'TRACE',
-        'STARTUP',
-        'RUNNING',
-        'CLUSTER',
-        'FILE';
-
-    my $previous_date = '';
-
     for my $row (@items) {
         my ($begin_date, $begin_time) = split_timestamp($row->{begin});
-        my ($end_date, $end_time) = split_timestamp($row->{end});
-        my $display_date = '';
-
-        if ($begin_date ne '' && $begin_date ne $previous_date) {
-            $display_date = $begin_date;
-        }
-
+        my ($end_date, $end_time)     = split_timestamp($row->{end});
+        my $display_date = ($begin_date ne '' && $begin_date ne $previous_date) ? $begin_date : '';
         $previous_date = $begin_date if $begin_date ne '';
 
         my $display_end = $end_time || 'N/A';
+        $display_end = "$end_date T $end_time" if ($end_date ne '' && $begin_date ne '' && $end_date ne $begin_date);
 
-        # Retain END date only when the file crosses to another date.
-        if (
-            $end_date ne ''
-            && $begin_date ne ''
-            && $end_date ne $begin_date
-        ) {
-            $display_end = $end_date . 'T' . $end_time;
-        }
-
-        my $ratio = $row->{trace_ratio} || 0;
-        my $cluster = cluster_code($row->{cluster});
-
-        printf "%-10s %-12s %-22s %-15s %-10.2f %-5s %-7s %-7s %-5s %s",
+        printf "%-10s %-12s %-23s %-12s %-13.2f %-1s %-1s %-1s %-7s %s",
             $display_date,
             $begin_time || 'N/A',
             $display_end,
             format_duration_verbose($row->{duration_ms}),
-            $ratio,
-            $row->{trace} ? 'YES' : 'NO',
-            $row->{startup} ? 'YES' : 'NO',
-            $row->{running} ? 'YES' : 'NO',
-            $cluster,
+            $row->{trace_ratio} || 0,
+            $row->{trace} ? 'Y' : '-',
+            $row->{startup} ? 'Y' : '-',
+            $row->{running} ? 'Y' : '-',
+            cluster_code($row->{cluster}),
             $row->{file};
 
-        if ($row->{status} ne 'OK') {
-            print " [$row->{status}]";
-        }
-
+        print " [$row->{status}]" if $row->{status} ne 'OK';
         print "\n";
     }
 }
 
-sub print_details_summary
-{
+sub print_verbose {
     my @items = @_;
+    printf "%-10s %-12s %-23s %-15s %-13s %-5s %-7s %-7s %-7s %s\n",
+        'DATE', 'BEGIN', 'END', 'DURATION', 'RATIO(T+D/I)', 'TRACE', 'STARTUP', 'RUNNING', 'CLUSTER', 'FILE';
 
-    my $total_files = scalar @items;
-    my $trace_enabled = 0;
-    my $non_trace = 0;
-    my $total_trace = 0;
-    my $total_debug = 0;
-    my $total_info = 0;
+    my $previous_date = '';
+    for my $row (@items) {
+        my ($begin_date, $begin_time) = split_timestamp($row->{begin});
+        my ($end_date, $end_time)     = split_timestamp($row->{end});
+        my $display_date = ($begin_date ne '' && $begin_date ne $previous_date) ? $begin_date : '';
+        $previous_date = $begin_date if $begin_date ne '';
+
+        my $display_end = $end_time || 'N/A';
+        $display_end = "$end_date T $end_time" if ($end_date ne '' && $begin_date ne '' && $end_date ne $begin_date);
+
+        printf "%-10s %-12s %-23s %-15s %-13.2f %-5s %-7s %-7s %-7s %s",
+            $display_date,
+            $begin_time || 'N/A',
+            $display_end,
+            format_duration_verbose($row->{duration_ms}),
+            $row->{trace_ratio} || 0,
+            $row->{trace} ? 'YES' : 'NO',
+            $row->{startup} ? 'YES' : 'NO',
+            $row->{running} ? 'YES' : 'NO',
+            cluster_code($row->{cluster}),
+            $row->{file};
+
+        print " [$row->{status}]" if $row->{status} ne 'OK';
+        print "\n";
+    }
+}
+
+sub print_details_summary {
+    my @items = @_;
+    my ($total_files, $trace_enabled, $non_trace) = (scalar @items, 0, 0);
+    my ($total_trace, $total_debug, $total_info) = (0, 0, 0);
 
     for my $row (@items) {
         $total_trace += $row->{trace_count} || 0;
         $total_debug += $row->{debug_count} || 0;
-        $total_info  += $row->{info_count} || 0;
-
-        if ($row->{trace}) {
-            $trace_enabled++;
-        }
-        else {
-            $non_trace++;
-        }
+        $total_info  += $row->{info_count}  || 0;
+        $row->{trace} ? $trace_enabled++ : $non_trace++;
     }
 
     print "\nTRACE determination summary\n";
-    print "Rule: TRACE is enabled only when TRACE + DEBUG > INFO in the sampled log window.\n";
-    print "Ratio = (TRACE + DEBUG) / INFO. >1.0 means TRACE/DEBUG dominates; <=1.0 means INFO dominates.\n";
-    print "Files analyzed: $total_files\n";
-    print "TRACE-enabled logs: $trace_enabled\n";
-    print "Not TRACE-enabled: $non_trace\n";
+    print "Files analyzed: $total_files | TRACE-enabled: $trace_enabled | Not TRACE-enabled: $non_trace\n";
     print "Observed sample counts: TRACE=$total_trace, DEBUG=$total_debug, INFO=$total_info\n\n";
 
     for my $row (@items) {
-        my $ratio = $row->{trace_ratio} || 0;
-        my $status = $row->{trace} ? 'TRACE_ENABLED' : 'NOT_TRACE_ENABLED';
-        my $cluster = $row->{cluster} || 'UNKNOWN';
-        my $cluster_code = cluster_code($cluster);
         printf "%-40s %-18s cluster=%-10s trace=%d debug=%d info=%d ratio=%.2f\n",
             $row->{file},
-            $status,
-            $cluster_code,
+            ($row->{trace} ? 'TRACE_ENABLED' : 'NOT_TRACE_ENABLED'),
+            cluster_code($row->{cluster}),
             $row->{trace_count} || 0,
             $row->{debug_count} || 0,
             $row->{info_count} || 0,
-            $ratio;
+            $row->{trace_ratio} || 0;
     }
-
     print "\n";
 }

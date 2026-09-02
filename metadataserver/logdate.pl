@@ -36,7 +36,7 @@ use warnings;
 use Getopt::Long qw(GetOptions);
 use Time::Local qw(timegm);
 
-our $VERSION = '2.2.8';
+our $VERSION = '2.2.9';
 
 # Details is the default. Use --compact to suppress the detailed report.
 my $details = 1;
@@ -143,44 +143,25 @@ Purpose:
   normalizes that hostname to its short lowercase form so it can compare it with
   the target hostname found in cluster redirect messages.
 
-  This is important because a redirect to the same short host is usually a local
-  self-redirect and can be ignored. A redirect to a different short host is a
-  strong clue that this server is acting as the primary/master node in the
-  metadata cluster.
+  If the target hostname matches the current node after normalization, the
+  redirect is self-directed and simply means this is a single metadata server,
+  not a clustered node. If the redirect target is different, that is strong
+  evidence this node is acting as the primary/master metadata server.
 
-  It is intended to help answer questions such as:
-    - When did this log begin and end?
-    - Did the log include a STARTUP state?
-    - Did the log include a RUNNING state?
-    - Is this log meaningfully TRACE-enabled or mostly INFO chatter?
-    - Is this node acting as the local metadata server, a peer, or the primary?
+  The cluster column therefore reports:
+    PRI = primary/master
+    2   = secondary
+    3   = tertiary
+    NO  = no cluster / single metadata server
 
-Cluster rule:
-  1. Extract the host from the top header, normalize it to short lowercase form.
-     Example: PSASMDATA01.jordan.housingbank.corp -> psasmdata01
-
-  2. Extract the redirect target from messages such as:
-     "Redirect client in cluster ... to server ... at psasmdata02.jordan..."
-
-  3. Normalize both names to short lowercase hostnames.
-
-  4. If the redirect target is the same as the current host, ignore it.
-     This is a self-redirect and is not evidence of cluster leadership.
-
-  5. If the redirect target is a different host, treat this node as likely
-     PRIMARY/PRI because it is redirecting clients to another metadata server.
-
-  6. If the log contains explicit master/secondary/tertiary wording, that is
-     used as a stronger indicator.
-
-  7. If there is no cluster marker and no remote redirect, the node is treated
-     as a single metadata server and shown as '-'.
+  6. If there is no cluster marker and no remote redirect, the node is treated
+     as a single metadata server and shown as 'NO'.
 
 Flags in the detailed output:
   T / TRACE     TRACE+DEBUG exceeds INFO in the sampled window
   S / STARTUP   SAH011001I State, starting found
   R / RUNNING   SAH011999I State, running found
-  CLUSTER       PRI = primary/master, 2 = secondary, 3 = tertiary, - = single server
+  CLUSTER       PRI = primary/master, 2 = secondary, 3 = tertiary, NO = no cluster
 
 Status values:
   OK             Normal analysis
@@ -265,10 +246,10 @@ sub analyze_file
             $row{cluster} = 'TERTIARY';
         }
         elsif ($sample =~ /Cluster\s+_NoCluster_/i) {
-            $row{cluster} = '-';
+            $row{cluster} = 'NO';
         }
         elsif ($sample =~ /\bcluster\b/i) {
-            $row{cluster} = '-';
+            $row{cluster} = 'NO';
         }
         else {
             $row{cluster} = classify_cluster($sample);
@@ -516,17 +497,24 @@ sub normalize_host
     $host =~ s/\s+$//;
     $host = lc($host);
     $host =~ s/\..*$//;
+    $host =~ s/.*_// if $host =~ /_\w+$/;
     return $host;
 }
 
 sub classify_cluster
 {
     my ($sample) = @_;
-    return '-' unless defined $sample && length $sample;
+    return 'NO' unless defined $sample && length $sample;
 
     my $local_host = '';
     if ($sample =~ /Host:\s*'([^']+)'/i) {
         $local_host = normalize_host($1);
+    }
+    elsif ($sample =~ /([A-Z][A-Z0-9]+_\d{8}_[A-Z0-9]+)\.log/i) {
+        my $from_name = $1;
+        $from_name =~ s/^.*_//;
+        $from_name =~ s/_[0-9]{8}.*$//;
+        $local_host = lc($from_name);
     }
 
     my $self_redirect = 0;
@@ -560,14 +548,14 @@ sub classify_cluster
     }
 
     if ($sample =~ /Cluster\s+_NoCluster_/i) {
-        return '-';
+        return 'NO';
     }
 
     if ($sample =~ /\bcluster\b/i) {
-        return '-';
+        return 'NO';
     }
 
-    return '-';
+    return 'NO';
 }
 
 sub cluster_code
@@ -577,14 +565,14 @@ sub cluster_code
     return 'PRI' if defined $cluster && $cluster =~ /^PRIMARY$/i;
     return '2'   if defined $cluster && $cluster =~ /^SECONDARY$/i;
     return '3'   if defined $cluster && $cluster =~ /^TERTIARY$/i;
-    return '-'   if defined $cluster && $cluster =~ /^(?:NO_CLUSTER|-|UNKNOWN|SINGLE)$/i;
+    return 'NO'  if defined $cluster && $cluster =~ /^(?:NO_CLUSTER|NO|UNKNOWN|SINGLE|-)$/i;
     return 'CL'  if defined $cluster && $cluster =~ /^CLUSTERED$/i;
     return 'PRI' if defined $cluster && $cluster =~ /^PRI$/i;
     return '2'   if defined $cluster && $cluster =~ /^2$/i;
     return '3'   if defined $cluster && $cluster =~ /^3$/i;
-    return '-'   if defined $cluster && $cluster =~ /^-$/i;
+    return 'NO'  if defined $cluster && $cluster =~ /^NO$/i;
     return 'CL'  if defined $cluster && $cluster =~ /^CL$/i;
-    return '-';
+    return 'NO';
 }
 
 sub print_compact

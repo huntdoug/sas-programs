@@ -36,7 +36,7 @@ use warnings;
 use Getopt::Long qw(GetOptions);
 use Time::Local qw(timegm);
 
-our $VERSION = '2.2.9';
+our $VERSION = '2.2.10';
 
 # Details is the default. Use --compact to suppress the detailed report.
 my $details = 1;
@@ -520,7 +520,7 @@ sub classify_cluster
     my $self_redirect = 0;
     my $remote_redirect = 0;
 
-    while ($sample =~ /redirect(?:ing)?[^\n]{0,200}?\bto\s+([A-Za-z0-9._-]+)/ig) {
+    while ($sample =~ /redirect(?:ing)?[^\n]{0,200}?\bat\s+([A-Za-z0-9._-]+)/ig) {
         my $target = normalize_host($1);
         next unless length $target;
         if (length $local_host && $target eq $local_host) {
@@ -528,6 +528,19 @@ sub classify_cluster
         }
         else {
             $remote_redirect = 1;
+        }
+    }
+
+    if (!$remote_redirect) {
+        while ($sample =~ /redirect(?:ing)?[^\n]{0,200}?\bto\s+(?!server\b)([A-Za-z0-9._-]+)/ig) {
+            my $target = normalize_host($1);
+            next unless length $target;
+            if (length $local_host && $target eq $local_host) {
+                $self_redirect = 1;
+            }
+            else {
+                $remote_redirect = 1;
+            }
         }
     }
 

@@ -9,27 +9,37 @@
 #
 # Verbose output is the default. Use -c for compact output.
 #
-# Flags:
-#   TRACE   Timestamped TRACE record found near the start of the log
-#   STARTUP SAH011001I ... State, starting found
-#   RUNNING SAH011999I ... State, running found
-#
 # Usage:
-#   logdate SASMeta*.log
+#   logdate [options] LOGFILE...
+#   logdate -d SASMeta*.log
 #   logdate -c SASMeta*.log
 #   logdate --version
 #
-
+# The program reads SAS Metadata Server log files, finds the first and last
+# timestamps, and summarizes whether the log appears to be in a TRACE-enabled
+# state. TRACE is considered enabled only when the sampled log window contains
+# more TRACE+DEBUG records than INFO records.
+#
+# This is a heuristic used to discriminate meaningful diagnostic logging from
+# a log that is mostly informational chatter.
+#
+# The script is intentionally conservative: a log with INFO dominating the
+# sampled window is treated as not TRACE-enabled even if a few TRACE records
+# appear.
+#
+# Author: Douglas Hunt (SAS domain expertise)
+# Developed with GitHub Copilot assistance
+#
 use strict;
 use warnings;
 
 use Getopt::Long qw(GetOptions);
 use Time::Local qw(timegm);
 
-our $VERSION = '2.2.2';
+our $VERSION = '2.2.3';
 
-# Verbose is the default.
-my $verbose = 1;
+# Details is the default. Use --compact to suppress the detailed report.
+my $details = 1;
 my $help = 0;
 my $version = 0;
 
@@ -40,8 +50,9 @@ my $block_size = 1024 * 1024;
 my $marker_bytes = 4 * 1024 * 1024;
 
 GetOptions(
-    'verbose|v'      => sub { $verbose = 1 },
-    'compact|c'      => sub { $verbose = 0 },
+    'details|d'      => sub { $details = 1 },
+    'verbose|v'      => sub { $details = 1 },
+    'compact|c'      => sub { $details = 0 },
     'version|V'      => \$version,
     'help|h'         => \$help,
     'block-size=i'   => \$block_size,
@@ -95,7 +106,8 @@ usage(1, 'no readable log files supplied') unless @rows;
     || $a->{file} cmp $b->{file}
 } @rows;
 
-if ($verbose) {
+if ($details) {
+    print_details_summary(@rows);
     print_verbose(@rows);
 }
 else {
@@ -113,31 +125,78 @@ sub usage
     my $fh = $status ? *STDERR : *STDOUT;
 
     print $fh <<'USAGE';
+logdate - Read SAS Metadata Server logs and determine start/end timing,
+state markers, and whether the log appears TRACE-enabled.
+
 Usage:
   logdate [options] LOGFILE...
+  logdate -d file1.log file2.log
+  logdate -c SASMeta*.log
+  logdate --version
+
+Purpose:
+  This utility inspects one or more SAS Metadata Server log files and reports
+  the first and last timestamp, elapsed duration, startup state, running state,
+  and whether the sampled log window suggests TRACE or DEBUG activity is active.
+
+  It is intended to help answer questions such as:
+    - When did this log begin and end?
+    - Did the log include a STARTUP state?
+    - Did the log include a RUNNING state?
+    - Is this log meaningfully TRACE-enabled or mostly INFO chatter?
+
+Detection rule:
+  TRACE is only considered enabled when the sampled log window contains more
+  TRACE+DEBUG records than INFO records.
+
+  In other words:
+      signal = TRACE + DEBUG
+      noise  = INFO
+      active = (signal > 0) and (signal > noise)
+
+  If INFO dominates the sampled window, the script reports the log as not
+  TRACE-enabled even if isolated TRACE lines are present.
+
+  This makes the result conservative and avoids false positives from logs that
+  contain a few TRACE statements but are mostly informational.
 
 Options:
-  -v, --verbose          Verbose output. This is the default.
-  -c, --compact          Compact output.
-  -V, --version          Show the program version.
-  -h, --help             Show this help.
+  -d, --details          Detailed report with per-file summary and timeline.
+  -v, --verbose          Backward-compatible alias for --details.
+  -c, --compact          Compact output table.
+  -V, --version          Show the program version and exit.
+  -h, --help             Show this help and exit.
 
       --block-size N     Seek/read block size.
                          Default: 1048576 bytes.
 
-      --marker-bytes N   Initial bytes inspected for TRACE,
+      --marker-bytes N   Initial bytes inspected for TRACE, DEBUG, INFO,
                          startup, and running markers.
                          Default: 4194304 bytes.
 
 Examples:
   logdate SASMeta*.log
+  logdate -d SASMeta_MetadataServer_*.log
   logdate -c SASMeta_MetadataServer_*.log
   logdate file1.log file2.log
+  logdate --version
 
-Flags:
-  T / TRACE     Timestamped TRACE record found
+Flags in the detailed output:
+  T / TRACE     TRACE+DEBUG exceeds INFO in the sampled window
   S / STARTUP   SAH011001I State, starting found
   R / RUNNING   SAH011999I State, running found
+
+Status values:
+  OK             Normal analysis
+  NO_BEGIN       No usable begin timestamp found
+  NO_END         No usable end timestamp found
+  END_BEFORE_BEGIN  End timestamp precedes the begin timestamp
+  BAD_TIMESTAMP  Invalid or unparsable timestamp format
+  OPEN_ERROR     File could not be opened
+  STAT_ERROR     File size/stat failure
+
+The detailed view prints the per-file decision using the rule above and also
+includes the count of TRACE, DEBUG, and INFO records observed in the sample.
 USAGE
 
     exit $status;
@@ -564,4 +623,50 @@ sub print_verbose
 
         print "\n";
     }
+}
+
+sub print_details_summary
+{
+    my @items = @_;
+
+    my $total_files = scalar @items;
+    my $trace_enabled = 0;
+    my $non_trace = 0;
+    my $total_trace = 0;
+    my $total_debug = 0;
+    my $total_info = 0;
+
+    for my $row (@items) {
+        $total_trace += $row->{trace_count} || 0;
+        $total_debug += $row->{debug_count} || 0;
+        $total_info  += $row->{info_count} || 0;
+
+        if ($row->{trace}) {
+            $trace_enabled++;
+        }
+        else {
+            $non_trace++;
+        }
+    }
+
+    print "\nTRACE determination summary\n";
+    print "Rule: TRACE is enabled only when TRACE + DEBUG > INFO in the sampled log window.\n";
+    print "Files analyzed: $total_files\n";
+    print "TRACE-enabled logs: $trace_enabled\n";
+    print "Not TRACE-enabled: $non_trace\n";
+    print "Observed sample counts: TRACE=$total_trace, DEBUG=$total_debug, INFO=$total_info\n\n";
+
+    for my $row (@items) {
+        my $ratio = $row->{trace_ratio} || 0;
+        my $status = $row->{trace} ? 'TRACE_ENABLED' : 'NOT_TRACE_ENABLED';
+        printf "%-40s %-18s trace=%d debug=%d info=%d ratio=%.2f\n",
+            $row->{file},
+            $status,
+            $row->{trace_count} || 0,
+            $row->{debug_count} || 0,
+            $row->{info_count} || 0,
+            $ratio;
+    }
+
+    print "\n";
 }

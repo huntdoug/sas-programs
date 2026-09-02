@@ -139,55 +139,48 @@ Purpose:
   the first and last timestamp, elapsed duration, startup state, running state,
   and whether the sampled log window suggests TRACE or DEBUG activity is active.
 
+  The file name and the first log line normally include the hostname. The script
+  normalizes that hostname to its short lowercase form so it can compare it with
+  the target hostname found in cluster redirect messages.
+
+  This is important because a redirect to the same short host is usually a local
+  self-redirect and can be ignored. A redirect to a different short host is a
+  strong clue that this server is acting as the primary/master node in the
+  metadata cluster.
+
   It is intended to help answer questions such as:
     - When did this log begin and end?
     - Did the log include a STARTUP state?
     - Did the log include a RUNNING state?
     - Is this log meaningfully TRACE-enabled or mostly INFO chatter?
+    - Is this node acting as the local metadata server, a peer, or the primary?
 
-Detection rule:
-  TRACE is only considered enabled when the sampled log window contains more
-  TRACE+DEBUG records than INFO records.
+Cluster rule:
+  1. Extract the host from the top header, normalize it to short lowercase form.
+     Example: PSASMDATA01.jordan.housingbank.corp -> psasmdata01
 
-  Ratio = (TRACE + DEBUG) / INFO
+  2. Extract the redirect target from messages such as:
+     "Redirect client in cluster ... to server ... at psasmdata02.jordan..."
 
-  Examples:
-    ratio = 2.50  => TRACE+DEBUG is 2.5x more common than INFO
-    ratio = 1.00  => equal amounts; TRACE is borderline and not strongly active
-    ratio = 0.50  => INFO is more common; not TRACE-enabled
+  3. Normalize both names to short lowercase hostnames.
 
-  If INFO dominates the sampled window, the script reports the log as not
-  TRACE-enabled even if isolated TRACE lines are present.
+  4. If the redirect target is the same as the current host, ignore it.
+     This is a self-redirect and is not evidence of cluster leadership.
 
-  This makes the result conservative and avoids false positives from logs that
-  contain a few TRACE statements but are mostly informational.
+  5. If the redirect target is a different host, treat this node as likely
+     PRIMARY/PRI because it is redirecting clients to another metadata server.
 
-Options:
-  -d, --details          Detailed report with per-file summary and timeline.
-  -v, --verbose          Backward-compatible alias for --details.
-  -c, --compact          Compact output table.
-  -V, --version          Show the program version and exit.
-  -h, --help             Show this help and exit.
+  6. If the log contains explicit master/secondary/tertiary wording, that is
+     used as a stronger indicator.
 
-      --block-size N     Seek/read block size.
-                         Default: 1048576 bytes.
-
-      --marker-bytes N   Initial bytes inspected for TRACE, DEBUG, INFO,
-                         startup, and running markers.
-                         Default: 4194304 bytes.
-
-Examples:
-  logdate SASMeta*.log
-  logdate -d SASMeta_MetadataServer_*.log
-  logdate -c SASMeta_MetadataServer_*.log
-  logdate file1.log file2.log
-  logdate --version
+  7. If there is no cluster marker and no remote redirect, the node is treated
+     as a single metadata server and shown as '-'.
 
 Flags in the detailed output:
   T / TRACE     TRACE+DEBUG exceeds INFO in the sampled window
   S / STARTUP   SAH011001I State, starting found
   R / RUNNING   SAH011999I State, running found
-  CL / CLUSTER   P = PRIMARY, S = SECONDARY, 3 = TERTIARY, N = NO_CLUSTER
+  CLUSTER       PRI = primary/master, 2 = secondary, 3 = tertiary, - = single server
 
 Status values:
   OK             Normal analysis

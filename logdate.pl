@@ -2,7 +2,7 @@
 #
 # logdate - Reads metadata logs and determines BEGIN|END date and important markers as to status.
 #
-# Author: Douglas Hunt (SAS domain expertise)
+# Author: Douglas Hunt (SAS domain expertise)  Circa 2019-2024?
 # Developed with GitHub Copilot assistance
 #
 

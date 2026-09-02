@@ -153,6 +153,10 @@ sub analyze_file
         end         => undef,
         duration_ms => undef,
         trace       => 0,
+        trace_count => 0,
+        debug_count => 0,
+        info_count  => 0,
+        trace_ratio => 0,
         startup     => 0,
         running     => 0,
         status      => 'OK',
@@ -182,8 +186,19 @@ sub analyze_file
     if ($sample_size > 0 && defined sysseek($fh, 0, 0)) {
         my $sample = read_exact($fh, $sample_size);
 
-        $row{trace} =
-            $sample =~ /^\d{4}-.*?\sTRACE\b/m ? 1 : 0;
+        my $trace_count = () = $sample =~ /^\d{4}-.*?\bTRACE\b/mg;
+        my $debug_count = () = $sample =~ /^\d{4}-.*?\bDEBUG\b/mg;
+        my $info_count  = () = $sample =~ /^\d{4}-.*?\bINFO\b/mg;
+
+        my $signal = $trace_count + $debug_count;
+        my $noise  = $info_count;
+
+        $row{trace_count} = $trace_count;
+        $row{debug_count} = $debug_count;
+        $row{info_count}  = $info_count;
+        $row{trace_ratio} = $signal / ($noise + 1);
+
+        $row{trace} = ($signal > 0 && $signal > $noise) ? 1 : 0;
 
         $row{startup} =
             $sample =~ /\bSAH011001I\b.*?\bState,\s*starting\b/i

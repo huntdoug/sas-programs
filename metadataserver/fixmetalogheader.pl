@@ -2,6 +2,9 @@
 #
 # fixmetalogheader 1.2.0
 #
+# Author: Douglas Hunt (SAS domain expertise)
+# Developed with GitHub Copilot assistance
+#
 # Repairs a SAS Metadata Server continuation log by prepending a startup
 # section taken from a complete TRACE-level donor startup log.
 #

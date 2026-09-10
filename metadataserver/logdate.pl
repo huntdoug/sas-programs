@@ -260,15 +260,36 @@ sub analyze_file
         }
 
         my @redirect_targets;
+        my %redirect_seen;
         while ($sample =~ /redirect(?:ing)?[^\n]{0,200}?\bat\s+([A-Za-z0-9._-]+)/ig) {
             my $target = $1;
             next unless length $target;
-            push @redirect_targets, $target;
+            $redirect_seen{$target}++;
         }
 
-        if (@redirect_targets) {
-            $row{redirect_hosts} = join(', ', @redirect_targets);
-            $row{norm_redirects} = join(', ', map { normalize_host($_) } @redirect_targets);
+        if (%redirect_seen) {
+            my @targets_with_count;
+            for my $target (sort keys %redirect_seen) {
+                my $count = $redirect_seen{$target};
+                if ($count > 1) {
+                    push @targets_with_count, "$target ($count)";
+                } else {
+                    push @targets_with_count, $target;
+                }
+            }
+            $row{redirect_hosts} = join(', ', @targets_with_count);
+            
+            my @norm_targets_with_count;
+            for my $target (sort keys %redirect_seen) {
+                my $normalized = normalize_host($target);
+                my $count = $redirect_seen{$target};
+                if ($count > 1) {
+                    push @norm_targets_with_count, "$normalized ($count)";
+                } else {
+                    push @norm_targets_with_count, $normalized;
+                }
+            }
+            $row{norm_redirects} = join(', ', @norm_targets_with_count);
         }
 
         my $trace_count = () = $sample =~ /^\d{4}-.*?\bTRACE\b/mg;

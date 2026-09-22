@@ -11,7 +11,7 @@ use Getopt::Long qw(GetOptions);
 use Time::Local qw(timegm);
 use Time::HiRes qw(time);
 
-our $VERSION = '2.2.27';
+our $VERSION = '2.2.28';
 
 my ($details, $verbose, $help, $show_version) = (1, 0, 0, 0);
 my $block_size = 1024 * 1024;
@@ -77,6 +77,7 @@ for my $r (@rows) {
     print "  Filename Host: $r->{name_host}  ->  $r->{norm_name}\n" if $r->{name_host};
     print "  Redirect Target(s): $r->{redirect_hosts}  ->  $r->{norm_redirects}\n" if $r->{redirect_hosts};
     print "  Classification: $r->{role}\n";
+    print "  Stopped: " . ($r->{stopped} ? 'YES' : 'NO') . "\n";
     print "  Redirects: $r->{redirect_count}\n";
 
     if ($details) {
@@ -184,7 +185,7 @@ sub analyze_file {
         duration_ms=>undef, host=>'', norm_host=>'', name_host=>'', norm_name=>'',
         os=>'', release=>'', sas_version=>'', command=>'', trace=>0,
         trace_count=>0, debug_count=>0, info_count=>0, trace_ratio=>0,
-        startup=>0, running=>0, lifecycle=>[], sample_redirect_count=>0,
+        startup=>0, running=>0, stopped=>0, lifecycle=>[], sample_redirect_count=>0,
         redirects=>[], redirect_count=>0, redirect_hosts=>'', norm_redirects=>'',
         ranges=>[], events=>[], favorites=>[], suppressed=>{},
         role=>'UNKNOWN', status=>'OK',
@@ -197,6 +198,11 @@ sub analyze_file {
     my $sample_size=$r{size}<$marker_bytes?$r{size}:$marker_bytes;
     analyze_sample(\%r,read_exact($fh,$sample_size),$file)
         if $sample_size>0 && defined sysseek($fh,0,0);
+
+    my $tail_size=$r{size}<$marker_bytes?$r{size}:$marker_bytes;
+    if (!$r{stopped} && $tail_size>0 && defined sysseek($fh,$r{size}-$tail_size,0)) {
+        $r{stopped}=1 if read_exact($fh,$tail_size)=~/\bState,\s*stopped\b/i;
+    }
 
     if ($details) {
         apply_scan(\%r,scan_log($fh,$file,1));
@@ -230,6 +236,7 @@ sub analyze_sample {
     $r->{trace_count}=()=$s=~/^\d{4}-.*?\bTRACE\b/mg;
     $r->{debug_count}=()=$s=~/^\d{4}-.*?\bDEBUG\b/mg;
     $r->{info_count}=()=$s=~/^\d{4}-.*?\bINFO\b/mg;
+    $r->{stopped}=1 if $s=~/\bState,\s*stopped\b/i;
     my$signal=$r->{trace_count}+$r->{debug_count};$r->{trace_ratio}=$signal/($r->{info_count}+1);
     $r->{trace}=($signal>0&&$signal>$r->{info_count})?1:0;
 }
@@ -383,8 +390,8 @@ sub print_header {
 }
 
 sub print_table {
-    my@rows=@_;printf"%-10s %-12s %-23s %-15s %-5s %-7s %-7s %-13s %-7s %s\n",'DATE','BEGIN','END','DURATION','TRACE','START','RUN','ROLE','RDIR','FILE';my$p='';
-    for my$r(@rows){my($bd,$bt)=split_timestamp($r->{begin});my($ed,$et)=split_timestamp($r->{end});my$d=($bd ne''&&$bd ne$p)?$bd:'';$p=$bd if$bd ne'';my$end=$et||'N/A';$end="$ed T $et"if$ed ne''&&$bd ne''&&$ed ne$bd;printf"%-10s %-12s %-23s %-15s %-5s %-7s %-7s %-13s %-7d %s",$d,$bt||'N/A',$end,format_duration($r->{duration_ms}),$r->{trace}?'YES':'NO',$r->{startup}?'YES':'NO',$r->{running}?'YES':'NO',$r->{role},$r->{redirect_count},$r->{file};print" [$r->{status}]"if$r->{status}ne'OK';print"\n"}
+    my@rows=@_;printf"%-10s %-12s %-23s %-15s %-5s %-7s %-7s %-8s %-13s %-7s %s\n",'DATE','BEGIN','END','DURATION','TRACE','START','RUN','STOPPED','ROLE','RDIR','FILE';my$p='';
+    for my$r(@rows){my($bd,$bt)=split_timestamp($r->{begin});my($ed,$et)=split_timestamp($r->{end});my$d=($bd ne''&&$bd ne$p)?$bd:'';$p=$bd if$bd ne'';my$end=$et||'N/A';$end="$ed T $et"if$ed ne''&&$bd ne''&&$ed ne$bd;printf"%-10s %-12s %-23s %-15s %-5s %-7s %-7s %-8s %-13s %-7d %s",$d,$bt||'N/A',$end,format_duration($r->{duration_ms}),$r->{trace}?'YES':'NO',$r->{startup}?'YES':'NO',$r->{running}?'YES':'NO',$r->{stopped}?'YES':'NO',$r->{role},$r->{redirect_count},$r->{file};print" [$r->{status}]"if$r->{status}ne'OK';print"\n"}
 }
 
 sub read_exact { my($fh,$n)=@_;my($b,$o)=('',0);while($o<$n){my$c=sysread($fh,$b,$n-$o,$o);last if!defined$c||$c==0;$o+=$c}return$b }

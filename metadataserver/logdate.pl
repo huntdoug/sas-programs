@@ -13,7 +13,7 @@ use warnings;
 use Getopt::Long qw(GetOptions);
 use Time::Local qw(timegm);
 
-our $VERSION = '2.2.19';
+our $VERSION = '2.2.20';
 
 my $details = 1;
 my $help = 0;

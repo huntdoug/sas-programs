@@ -1,5 +1,5 @@
 #!/bin/sh
-# cd to the Logs directory
+
 #
 # 10/16/2017 Douglas Hunt
 # 06/13/2025 major update using searchstring files for egrep but originating from this single script.

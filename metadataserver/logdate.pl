@@ -13,7 +13,7 @@ use warnings;
 use Getopt::Long qw(GetOptions);
 use Time::Local qw(timegm);
 
-our $VERSION = '2.2.18';
+our $VERSION = '2.2.19';
 
 my $details = 1;
 my $help = 0;
@@ -136,6 +136,7 @@ sub analyze_file {
         norm_redirects => '',
         startup        => 0,
         running        => 0,
+        stopped        => 0,
         status         => 'OK',
     );
 
@@ -218,6 +219,13 @@ sub analyze_file {
 
         $row{startup} = ($sample =~ /\bSAH011001I\b.*?\bState,\s*starting\b/i) ? 1 : 0;
         $row{running} = ($sample =~ /\bSAH011999I\b.*?\bState,\s*running\b/i) ? 1 : 0;
+        $row{stopped} = ($sample =~ /\bState,\s*stopped\b/i) ? 1 : 0;
+
+        my $tail_size = $size < $marker_bytes ? $size : $marker_bytes;
+        if (!$row{stopped} && $tail_size > 0 && defined sysseek($fh, $size - $tail_size, 0)) {
+            my $tail = read_exact($fh, $tail_size);
+            $row{stopped} = ($tail =~ /\bState,\s*stopped\b/i) ? 1 : 0;
+        }
     }
 
     close($fh);
@@ -387,8 +395,8 @@ sub cluster_code {
 
 sub print_compact {
     my @items = @_;
-    printf "%-10s %-12s %-23s %-12s %-13s %-1s %-1s %-1s %-7s %s\n",
-        'DATE', 'BEGIN', 'END', 'DUR', 'RATIO(T+D/I)', 'T', 'S', 'R', 'CLUSTER', 'FILE';
+    printf "%-10s %-12s %-23s %-12s %-13s %-1s %-1s %-1s %-7s %-7s %s\n",
+        'DATE', 'BEGIN', 'END', 'DUR', 'RATIO(T+D/I)', 'T', 'S', 'R', 'STOPPED', 'CLUSTER', 'FILE';
 
     my $previous_date = '';
     for my $row (@items) {
@@ -400,7 +408,7 @@ sub print_compact {
         my $display_end = $end_time || 'N/A';
         $display_end = "$end_date T $end_time" if ($end_date ne '' && $begin_date ne '' && $end_date ne $begin_date);
 
-        printf "%-10s %-12s %-23s %-12s %-13.2f %-1s %-1s %-1s %-7s %s",
+        printf "%-10s %-12s %-23s %-12s %-13.2f %-1s %-1s %-1s %-7s %-7s %s",
             $display_date,
             $begin_time || 'N/A',
             $display_end,
@@ -409,6 +417,7 @@ sub print_compact {
             $row->{trace} ? 'Y' : '-',
             $row->{startup} ? 'Y' : '-',
             $row->{running} ? 'Y' : '-',
+            $row->{stopped} ? 'Y' : '-',
             cluster_code($row->{cluster}),
             $row->{file};
 
@@ -419,8 +428,8 @@ sub print_compact {
 
 sub print_verbose {
     my @items = @_;
-    printf "%-10s %-12s %-23s %-15s %-13s %-5s %-7s %-7s %-7s %s\n",
-        'DATE', 'BEGIN', 'END', 'DURATION', 'RATIO(T+D/I)', 'TRACE', 'STARTUP', 'RUNNING', 'CLUSTER', 'FILE';
+    printf "%-10s %-12s %-23s %-15s %-13s %-5s %-7s %-7s %-7s %-7s %s\n",
+        'DATE', 'BEGIN', 'END', 'DURATION', 'RATIO(T+D/I)', 'TRACE', 'STARTUP', 'RUNNING', 'STOPPED', 'CLUSTER', 'FILE';
 
     my $previous_date = '';
     for my $row (@items) {
@@ -432,7 +441,7 @@ sub print_verbose {
         my $display_end = $end_time || 'N/A';
         $display_end = "$end_date T $end_time" if ($end_date ne '' && $begin_date ne '' && $end_date ne $begin_date);
 
-        printf "%-10s %-12s %-23s %-15s %-13.2f %-5s %-7s %-7s %-7s %s",
+        printf "%-10s %-12s %-23s %-15s %-13.2f %-5s %-7s %-7s %-7s %-7s %s",
             $display_date,
             $begin_time || 'N/A',
             $display_end,
@@ -441,6 +450,7 @@ sub print_verbose {
             $row->{trace} ? 'YES' : 'NO',
             $row->{startup} ? 'YES' : 'NO',
             $row->{running} ? 'YES' : 'NO',
+            $row->{stopped} ? 'YES' : 'NO',
             cluster_code($row->{cluster}),
             $row->{file};
 

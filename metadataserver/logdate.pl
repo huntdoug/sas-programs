@@ -4,7 +4,7 @@
 #
 # Fast SAS Metadata Server log timeline utility.
 #
-# Author: Douglas Hunt (SAS domain expertise)
+# Author: Douglas Hunt (SAS domain expertise)!
 # Developed with GitHub Copilot assistance
 #
 use strict;

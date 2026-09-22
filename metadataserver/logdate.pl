@@ -1,74 +1,59 @@
 #!/usr/bin/env perl
 #
-# logdate
+# logdate - SAS Metadata Server timeline and cluster incident analyzer
 #
-# Fast SAS Metadata Server log timeline utility.
-#
-# Author: Douglas Hunt (SAS domain expertise)!
+# Author: Douglas Hunt (SAS domain expertise)
 # Developed with GitHub Copilot assistance
 #
 use strict;
 use warnings;
-
 use Getopt::Long qw(GetOptions);
 use Time::Local qw(timegm);
+use Time::HiRes qw(time);
 
-our $VERSION = '2.2.20';
+our $VERSION = '2.2.27';
 
-my $details = 1;
-my $help = 0;
-my $version = 0;
-
+my ($details, $verbose, $help, $show_version) = (1, 0, 0, 0);
 my $block_size = 1024 * 1024;
 my $marker_bytes = 4 * 1024 * 1024;
+my $singleton_threshold = 10;
+my $favorites_file = 'logdate.favorite.strings';
+my $suppress_file = 'logdate.suppress.strings';
+my $write_pattern_files = 0;
 
 GetOptions(
-    'details|d'      => sub { $details = 1 },
-    'verbose|v'      => sub { $details = 1 },
-    'compact|c'      => sub { $details = 0 },
-    'version|V'      => \$version,
-    'help|h'         => \$help,
-    'block-size=i'   => \$block_size,
-    'marker-bytes=i' => \$marker_bytes,
+    'details|d'             => sub { $details = 1; $verbose = 0 },
+    'verbose|v'             => sub { $details = 1; $verbose = 1 },
+    'compact|c'             => sub { $details = 0; $verbose = 0 },
+    'version|V'             => \$show_version,
+    'help|h'                => \$help,
+    'block-size=i'          => \$block_size,
+    'marker-bytes=i'        => \$marker_bytes,
+    'singleton-threshold=i' => \$singleton_threshold,
+    'favorites=s'           => \$favorites_file,
+    'suppress=s'            => \$suppress_file,
+    'write-pattern-files'   => \$write_pattern_files,
 ) or usage(2);
 
-if ($version) {
-    print "logdate $VERSION\n";
-    exit 0;
-}
-
+if ($show_version) { print "logdate $VERSION\n"; exit 0; }
 usage(0) if $help;
+die "logdate: --block-size must be at least 4096\n" if $block_size < 4096;
+die "logdate: --marker-bytes must be at least 4096\n" if $marker_bytes < 4096;
+die "logdate: --singleton-threshold must be at least 3\n" if $singleton_threshold < 3;
+
+write_default_pattern_files() if $write_pattern_files;
 usage(2, 'no log files supplied') unless @ARGV;
 
-die "logdate: --block-size must be at least 4096\n"
-    if $block_size < 4096;
-
-die "logdate: --marker-bytes must be at least 4096\n"
-    if $marker_bytes < 4096;
-
-my $TIMESTAMP_RE = qr{
-    ^
-    (
-        \d{4}-\d{2}-\d{2}
-        T
-        \d{2}:\d{2}:\d{2},
-        \d{3}
-    )
-}mx;
-
-print "logdate $VERSION\n\n";
-
-my %seen;
-my @rows;
+my @favorite_patterns = load_patterns($favorites_file);
+my @suppress_patterns = load_patterns($suppress_file);
+my $TIMESTAMP_RE = qr{^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2},\d{3})}m;
+my $started = time();
+my (%seen, @rows);
 
 for my $file (grep { !$seen{$_}++ } @ARGV) {
-    if (!-f $file) {
-        warn "logdate: warning: not a regular file: $file\n";
-        next;
-    }
+    if (!-f $file) { warn "logdate: warning: not a regular file: $file\n"; next; }
     push @rows, analyze_file($file);
 }
-
 usage(1, 'no readable log files supplied') unless @rows;
 
 @rows = sort {
@@ -77,413 +62,341 @@ usage(1, 'no readable log files supplied') unless @rows;
     || $a->{file} cmp $b->{file}
 } @rows;
 
-print "=== Hostname Analysis ===\n";
-for my $row (@rows) {
-    print "File: $row->{file}\n";
-    print "  Header Host: $row->{header_host}  ->  $row->{norm_header}\n" if $row->{header_host};
-    print "  Filename Host: $row->{name_host}  ->  $row->{norm_name}\n" if $row->{name_host};
-    print "  Redirect Target(s): $row->{redirect_hosts}  ->  $row->{norm_redirects}\n" if $row->{redirect_hosts};
-    print "  Classification: $row->{cluster}\n\n";
+my $elapsed = time() - $started;
+$elapsed = 0.000001 if $elapsed <= 0;
+$details ? print_header($elapsed, @rows) : print "logdate $VERSION\n\n";
+
+print "=== Per-Log Analysis ===\n";
+for my $r (@rows) {
+    print "FILE: $r->{file}\n";
+    print "  Host: '$r->{host}'\n" if $r->{host};
+    print "  OS: '$r->{os}'\n" if $r->{os};
+    print "  Release: '$r->{release}'\n" if $r->{release};
+    print "  SAS Version: '$r->{sas_version}'\n" if $r->{sas_version};
+    print "  Command: '$r->{command}'\n" if $r->{command};
+    print "  Filename Host: $r->{name_host}  ->  $r->{norm_name}\n" if $r->{name_host};
+    print "  Redirect Target(s): $r->{redirect_hosts}  ->  $r->{norm_redirects}\n" if $r->{redirect_hosts};
+    print "  Classification: $r->{role}\n";
+    print "  Redirects: $r->{redirect_count}\n";
+
+    if ($details) {
+        print_server_lifecycle($r);
+        print_redirect_summary($r) if $r->{redirect_count};
+        print_easy_incident_summary($r);
+        print_interesting_events($r);
+        print_verbose_events($r) if $verbose;
+    }
+    print "\n";
 }
 
-if ($details) {
-    print_details_summary(@rows);
-    print_verbose(@rows);
-}
-else {
-    print_compact(@rows);
-}
-
+print_cluster_findings(@rows) if $details;
+print_table(@rows);
 exit 0;
 
 sub usage {
     my ($status, $message) = @_;
     warn "logdate: $message\n" if defined $message;
     my $fh = $status ? *STDERR : *STDOUT;
-
     print $fh <<'USAGE';
-logdate - Read SAS Metadata Server logs and determine start/end timing,
-state markers, and whether the log appears TRACE-enabled.
+logdate - SAS Metadata Server timeline and cluster incident analyzer.
 
 Usage:
   logdate [options] LOGFILE...
-  logdate -d file1.log file2.log
   logdate -c SASMeta*.log
-  logdate --version
+  logdate -d SASMeta*.log
+  logdate -v SASMeta*.log
+
+Options:
+  -c, --compact                 Fast output. Non-TRACE logs receive a full
+                                redirect-count scan; TRACE logs use a sample.
+  -d, --details                 Full default analysis.
+  -v, --verbose                 Default analysis plus every incident event.
+      --singleton-threshold N   Suppress N or more consecutive one-event
+                                redirect ranges. Default: 10.
+      --favorites FILE          Optional favorite regex file.
+      --suppress FILE           Optional suppression regex file.
+      --write-pattern-files     Create starter pattern files.
+  -V, --version
+  -h, --help
 USAGE
     exit $status;
 }
 
+sub default_favorites {
+    return (
+        'The outcall request did not complete in the time allotted',
+        'Lost contact with the server when calling an IOM interface',
+        'could not send update to peer', 'Disconnecting server',
+        'Connecting server', 'Setting the master', 'Changing the master',
+        'lost quorum', 'achieved quorum', 'New out call client connection',
+        'SAH011001I', 'SAH011999I',
+        'Attempts to synchronize the metadata on this node.*failed',
+        'most recent update on the connecting server.*not one of the updates',
+        'failed to redirect', 'Balance algorithm timed out',
+        '\bERROR\b', '\bFATAL\b',
+    );
+}
+
+sub default_suppressions {
+    return (
+        'Load Balancing interface call failed',
+        'The peer application did not start SSL negotiations as expected',
+        'MetadataServerBackupManifest', '\bLockedBy\b', '\bisLockedOut=0\b',
+        'The Bridge Protocol Engine Socket Access Method lost contact with a peer',
+    );
+}
+
+sub write_default_pattern_files {
+    write_pattern_file($favorites_file, 'Favorite SAS Metadata Server patterns', [default_favorites()]);
+    write_pattern_file($suppress_file, 'Suppressed/noisy patterns', [default_suppressions()]);
+    print "Created $favorites_file and $suppress_file\n";
+}
+
+sub write_pattern_file {
+    my ($file, $title, $patterns) = @_;
+    return if -e $file;
+    open(my $fh, '>', $file) or die "logdate: cannot create $file: $!\n";
+    print $fh "# $title\n# One Perl-compatible regex per line.\n\n";
+    print $fh "$_\n" for @$patterns;
+    close($fh);
+}
+
+sub load_patterns {
+    my ($file) = @_;
+    return () unless defined $file && -f $file;
+    open(my $fh, '<', $file) or do { warn "logdate: cannot read $file: $!\n"; return () };
+    my @patterns;
+    while (my $line = <$fh>) {
+        $line =~ s/[\r\n]+$//;
+        $line =~ s/^\s+|\s+$//g;
+        next if $line eq '' || $line =~ /^#/;
+        my $ok = eval { qr/$line/i; 1 };
+        $ok ? push(@patterns, $line) : warn "logdate: invalid regex ignored: $line\n";
+    }
+    close($fh);
+    return @patterns;
+}
+
 sub analyze_file {
     my ($file) = @_;
-
-    my %row = (
-        file           => $file,
-        begin          => undef,
-        end            => undef,
-        duration_ms    => undef,
-        trace          => 0,
-        trace_count    => 0,
-        debug_count    => 0,
-        info_count     => 0,
-        trace_ratio    => 0,
-        cluster        => 'UNKNOWN',
-        header_host    => '',
-        name_host      => '',
-        redirect_hosts => '',
-        norm_header    => '',
-        norm_name      => '',
-        norm_redirects => '',
-        startup        => 0,
-        running        => 0,
-        stopped        => 0,
-        status         => 'OK',
+    my %r = (
+        file=>$file, size=>(-s $file || 0), begin=>undef, end=>undef,
+        duration_ms=>undef, host=>'', norm_host=>'', name_host=>'', norm_name=>'',
+        os=>'', release=>'', sas_version=>'', command=>'', trace=>0,
+        trace_count=>0, debug_count=>0, info_count=>0, trace_ratio=>0,
+        startup=>0, running=>0, lifecycle=>[], sample_redirect_count=>0,
+        redirects=>[], redirect_count=>0, redirect_hosts=>'', norm_redirects=>'',
+        ranges=>[], events=>[], favorites=>[], suppressed=>{},
+        role=>'UNKNOWN', status=>'OK',
     );
 
-    my $size = -s $file;
-    if (!defined $size) {
-        $row{status} = 'STAT_ERROR';
-        return \%row;
-    }
-
-    my $fh;
-    if (!open($fh, '<', $file)) {
-        $row{status} = "OPEN_ERROR: $!";
-        return \%row;
-    }
+    open(my $fh, '<', $file) or do { $r{status}="OPEN_ERROR: $!"; return \%r };
     binmode($fh);
+    $r{begin}=find_begin($fh,$r{size});
+    $r{end}=find_end($fh,$r{size});
+    my $sample_size=$r{size}<$marker_bytes?$r{size}:$marker_bytes;
+    analyze_sample(\%r,read_exact($fh,$sample_size),$file)
+        if $sample_size>0 && defined sysseek($fh,0,0);
 
-    $row{begin} = find_begin($fh, $size);
-    $row{end}   = find_end($fh, $size);
-
-    my $sample_size = $size < $marker_bytes ? $size : $marker_bytes;
-
-    if ($sample_size > 0 && defined sysseek($fh, 0, 0)) {
-        my $sample = read_exact($fh, $sample_size);
-
-        if ($sample =~ /Host:\s*'([^']+)'/i) {
-            $row{header_host} = $1;
-            $row{norm_header} = normalize_host($1);
-        }
-
-        if ($file =~ /SASMeta_MetadataServer_[0-9T-]+_([A-Z0-9]+)_/i) {
-            $row{name_host} = $1;
-            $row{norm_name} = lc(normalize_host($1));
-        }
-
-        my %redirect_seen;
-        while ($sample =~ /redirect(?:ing)?[^\n]{0,200}?\bat\s+([A-Za-z0-9._-]+)/ig) {
-            my $target = $1;
-            next unless length $target;
-            $redirect_seen{$target}++;
-        }
-
-        if (%redirect_seen) {
-            my @targets_with_count;
-            for my $target (sort keys %redirect_seen) {
-                my $count = $redirect_seen{$target};
-                if ($count > 1) {
-                    push @targets_with_count, "$target ($count)";
-                } else {
-                    push @targets_with_count, $target;
-                }
-            }
-            $row{redirect_hosts} = join(', ', @targets_with_count);
-            
-            my @norm_targets_with_count;
-            for my $target (sort keys %redirect_seen) {
-                my $normalized = normalize_host($target);
-                my $count = $redirect_seen{$target};
-                if ($count > 1) {
-                    push @norm_targets_with_count, "$normalized ($count)";
-                } else {
-                    push @norm_targets_with_count, $normalized;
-                }
-            }
-            $row{norm_redirects} = join(', ', @norm_targets_with_count);
-        }
-
-        my $trace_count = () = $sample =~ /^\d{4}-.*?\bTRACE\b/mg;
-        my $debug_count = () = $sample =~ /^\d{4}-.*?\bDEBUG\b/mg;
-        my $info_count  = () = $sample =~ /^\d{4}-.*?\bINFO\b/mg;
-
-        my $signal = $trace_count + $debug_count;
-        my $noise  = $info_count;
-
-        $row{trace_count} = $trace_count;
-        $row{debug_count} = $debug_count;
-        $row{info_count}  = $info_count;
-        $row{trace_ratio} = $signal / ($noise + 1);
-        $row{trace}       = ($signal > 0 && $signal > $noise) ? 1 : 0;
-        $row{cluster}     = classify_cluster($sample);
-
-        $row{startup} = ($sample =~ /\bSAH011001I\b.*?\bState,\s*starting\b/i) ? 1 : 0;
-        $row{running} = ($sample =~ /\bSAH011999I\b.*?\bState,\s*running\b/i) ? 1 : 0;
-        $row{stopped} = ($sample =~ /\bState,\s*stopped\b/i) ? 1 : 0;
-
-        my $tail_size = $size < $marker_bytes ? $size : $marker_bytes;
-        if (!$row{stopped} && $tail_size > 0 && defined sysseek($fh, $size - $tail_size, 0)) {
-            my $tail = read_exact($fh, $tail_size);
-            $row{stopped} = ($tail =~ /\bState,\s*stopped\b/i) ? 1 : 0;
-        }
+    if ($details) {
+        apply_scan(\%r,scan_log($fh,$file,1));
+        $r{role}=$r{redirect_count}?'MASTER':'SLAVE';
+        $r{ranges}=build_ranges(\%r);
+    } elsif (!$r{trace}) {
+        apply_scan(\%r,scan_log($fh,$file,0));
+        $r{role}=$r{redirect_count}?'MASTER':'SLAVE';
+    } else {
+        $r{redirect_count}=$r{sample_redirect_count};
+        $r{role}=$r{redirect_count}?'MASTER-LIKELY':'UNKNOWN';
     }
-
     close($fh);
 
-    return \%row unless defined $row{begin} && defined $row{end};
-
-    my $begin_ms = timestamp_ms($row{begin});
-    my $end_ms   = timestamp_ms($row{end});
-
-    if (!defined $begin_ms || !defined $end_ms) {
-        $row{status} = 'BAD_TIMESTAMP';
-        return \%row;
+    if (defined $r{begin} && defined $r{end}) {
+        my($b,$e)=(timestamp_ms($r{begin}),timestamp_ms($r{end}));
+        if(defined$b&&defined$e){$r{duration_ms}=$e-$b;$r{status}='END_BEFORE_BEGIN' if$r{duration_ms}<0}
+        else{$r{status}='BAD_TIMESTAMP'}
     }
-
-    $row{duration_ms} = $end_ms - $begin_ms;
-    $row{status} = 'END_BEFORE_BEGIN' if $row{duration_ms} < 0;
-
-    return \%row;
+    return \%r;
 }
 
-sub read_exact {
-    my ($fh, $length) = @_;
-    my $buffer = '';
-    my $offset = 0;
+sub analyze_sample {
+    my($r,$s,$file)=@_;
+    $s =~ s/^\x{FEFF}//;
+    if($s=~/Host:\s*'([^']+)'\s*,\s*OS:\s*'([^']*)'\s*,\s*Release:\s*'([^']*)'\s*,\s*SAS Version:\s*'([^']*)'\s*,\s*Command:\s*'([^']*)'/is){
+        ($r->{host},$r->{os},$r->{release},$r->{sas_version},$r->{command})=($1,$2,$3,$4,$5);$r->{norm_host}=normalize_host($1)
+    }elsif($s=~/Host:\s*'([^']+)'/i){$r->{host}=$1;$r->{norm_host}=normalize_host($1)}
+    if($file=~/SASMeta_MetadataServer_[0-9T-]+_([A-Z0-9]+)_/i){$r->{name_host}=$1;$r->{norm_name}=normalize_host($1)}
+    $r->{sample_redirect_count}=()=$s=~/redirect(?:ing)?[^\n]{0,500}?\bat\s+[A-Za-z0-9._-]+/ig;
+    $r->{trace_count}=()=$s=~/^\d{4}-.*?\bTRACE\b/mg;
+    $r->{debug_count}=()=$s=~/^\d{4}-.*?\bDEBUG\b/mg;
+    $r->{info_count}=()=$s=~/^\d{4}-.*?\bINFO\b/mg;
+    my$signal=$r->{trace_count}+$r->{debug_count};$r->{trace_ratio}=$signal/($r->{info_count}+1);
+    $r->{trace}=($signal>0&&$signal>$r->{info_count})?1:0;
+}
 
-    while ($offset < $length) {
-        my $count = sysread($fh, $buffer, $length - $offset, $offset);
-        last if !defined $count || $count == 0;
-        $offset += $count;
+sub scan_log {
+    my($fh,$file,$collect)=@_;
+    my(@redirects,@events,@favorites,@lifecycle,%suppressed);
+    return{redirects=>[],events=>[],favorites=>[],lifecycle=>[],suppressed=>{}}
+        unless defined sysseek($fh,0,0);
+    my($ts,$seq)=(undef,0);
+    while(my$line=<$fh>){
+        $ts=$1 if$line=~/$TIMESTAMP_RE/;
+        next unless defined$ts;
+
+        if($line=~/redirect(?:ing)?[^\n]{0,500}?\bat\s+([A-Za-z0-9._-]+)/i){
+            my($target,$norm)=($1,normalize_host($1));
+            push@redirects,{timestamp=>$ts,target=>$target,norm_target=>$norm,sequence=>$seq++} if length$norm;
+        }
+
+        if($line=~/\bSAH011001I\b.*?\bState,\s*starting\b/i){
+            push@lifecycle,{timestamp=>$ts,type=>'STARTING',code=>'SAH011001I',sequence=>$seq++};
+        }
+        if($line=~/\bSAH011999I\b.*?\bState,\s*running\b/i){
+            push@lifecycle,{timestamp=>$ts,type=>'RUNNING',code=>'SAH011999I',sequence=>$seq++};
+        }
+
+        next unless$collect;
+        my$event=classify_event($ts,$line,$seq++);push@events,$event if$event;
+        my$suppressed_by=matches_any($line,@suppress_patterns ? @suppress_patterns : default_suppressions());
+        $suppressed{$suppressed_by}++ if $suppressed_by;
+        my$favorite=matches_any($line,@favorite_patterns ? @favorite_patterns : default_favorites());
+        push@favorites,{timestamp=>$ts,pattern=>$favorite,text=>clean_line($line),sequence=>$seq++} if$favorite;
     }
-    return $buffer;
+    return{redirects=>\@redirects,events=>\@events,favorites=>\@favorites,lifecycle=>\@lifecycle,suppressed=>\%suppressed};
 }
 
-sub find_begin {
-    my ($fh, $size) = @_;
-    my $offset = 0;
-    my $carry = '';
+sub matches_any { my($line,@patterns)=@_;for my$p(@patterns){return$p if eval{$line=~/$p/i}}return'' }
 
-    while ($offset < $size) {
-        my $remaining = $size - $offset;
-        my $length = $remaining < $block_size ? $remaining : $block_size;
+sub classify_event {
+    my($ts,$line,$seq)=@_;my($type,$detail,$peer)=('','','');
+    if($line=~/The outcall request did not complete in the time allotted/i){($type,$detail)=('OUTCALL_TIMEOUT','The outcall request did not complete in the time allotted.')}
+    elsif($line=~/Lost contact with the server when calling an IOM interface/i){($type,$detail)=('IOM_CONTACT_LOST','Lost contact with the server when calling an IOM interface.')}
+    elsif($line=~/could not send update to peer\s*\((?:[^)]*?\@)?([^\s)]+)/i){($type,$peer,$detail)=('PEER_UPDATE_FAILURE',normalize_host($1),'Could not send update to peer.')}
+    elsif($line=~/Load Balancing interface call failed/i){($type,$detail)=('LOAD_BALANCER_WRAPPER','Generic Load Balancing failure wrapper.')}
+    elsif($line=~/Disconnecting server\s+(.+?)\s+from cluster/i){($type,$peer,$detail)=('PEER_DISCONNECT',clean_value($1),'Server disconnected from cluster.')}
+    elsif($line=~/Connecting server\s+(.+?)\s+to cluster/i){($type,$peer,$detail)=('PEER_CONNECT',clean_value($1),'Server connecting to cluster.')}
+    elsif($line=~/Setting the master node to\s+(.+?)\.?\s*$/i){($type,$peer,$detail)=('MASTER_CHANGE',clean_value($1),'Setting the master node.')}
+    elsif($line=~/Changing the master/i){($type,$detail)=('CHANGING_MASTER','Changing the master.')}
+    elsif($line=~/cluster has lost quorum.*OFFLINE/i){($type,$detail)=('LOST_QUORUM','Cluster lost quorum and is now OFFLINE.')}
+    elsif($line=~/cluster has achieved quorum.*ONLINE/i){($type,$detail)=('ACHIEVED_QUORUM','Cluster achieved quorum and is now ONLINE.')}
+    elsif($line=~/New out call client connection/i){($type,$detail)=('NEW_OUTCALL_CONNECTION','New peer out-call connection.')}
+    elsif($line=~/Attempts to synchronize the metadata on this node.*failed/i){($type,$detail)=('SYNC_FAILURE','Metadata synchronization failed.')}
+    elsif($line=~/most recent update on the connecting server.*not one of the updates/i){($type,$detail)=('REPOSITORY_MISMATCH','Connecting server update does not match cluster.')}
+    elsif($line=~/failed to redirect/i){($type,$detail)=('FAILED_REDIRECT','Client redirect failed.')}
+    else{return undef}
+    my$identity=$1 if$line=~/\]\s+([^\s]+)\s+-/;
+    return{timestamp=>$ts,type=>$type,detail=>$detail,peer=>$peer,identity=>($identity||''),sequence=>$seq,raw=>clean_line($line)};
+}
 
-        return undef unless defined sysseek($fh, $offset, 0);
-        my $block = read_exact($fh, $length);
-        last if $block eq '';
+sub apply_scan {
+    my($r,$scan)=@_;
+    $r->{redirects}=$scan->{redirects};$r->{redirect_count}=scalar@{$scan->{redirects}};
+    $r->{events}=$scan->{events};$r->{favorites}=$scan->{favorites};
+    $r->{lifecycle}=$scan->{lifecycle};$r->{suppressed}=$scan->{suppressed};
+    $r->{startup}=scalar(grep{$_->{type}eq'STARTING'}@{$r->{lifecycle}})?1:0;
+    $r->{running}=scalar(grep{$_->{type}eq'RUNNING'}@{$r->{lifecycle}})?1:0;
+    my(%seen,@raw,@norm);for my$e(@{$r->{redirects}}){next if$seen{$e->{norm_target}}++;push@raw,$e->{target};push@norm,$e->{norm_target}}
+    $r->{redirect_hosts}=join(', ',@raw)if@raw;$r->{norm_redirects}=join(', ',@norm)if@norm;
+}
 
-        my $data = $carry . $block;
-        return $1 if $data =~ /$TIMESTAMP_RE/;
+sub build_ranges {
+    my($r)=@_;my@e=sort{$a->{timestamp}cmp$b->{timestamp}||$a->{sequence}<=>$b->{sequence}}@{$r->{redirects}};return[]unless@e;
+    my@effective;for my$x(@e){if(@effective&&$effective[-1]{timestamp}eq$x->{timestamp}){$effective[-1]=$x}else{push@effective,$x}}
+    my@ranges;for my$x(@effective){if(@ranges&&$ranges[-1]{norm_target}eq$x->{norm_target}){$ranges[-1]{events}++;next}push@ranges,{start=>$x->{timestamp},norm_target=>$x->{norm_target},events=>1}}
+    $ranges[0]{start}=$r->{begin}if defined$r->{begin};for my$i(0..$#ranges){$ranges[$i]{end}=$i<$#ranges?$ranges[$i+1]{start}:$r->{end}}return\@ranges;
+}
 
-        $carry = length($data) > 128 ? substr($data, -128) : $data;
-        $offset += length($block);
+sub print_server_lifecycle {
+    my($r)=@_;
+    print "\n  Server Lifecycle\n  ----------------\n";
+    if(!@{$r->{lifecycle}}){print "  No SAH lifecycle markers found.\n";return}
+    for my$e(sort{$a->{timestamp}cmp$b->{timestamp}||$a->{sequence}<=>$b->{sequence}}@{$r->{lifecycle}}){
+        printf "  %-12s %-10s %s\n",time_only($e->{timestamp}),$e->{type},$e->{code};
     }
-    return undef;
+    my($starting)=grep{$_->{type}eq'STARTING'}@{$r->{lifecycle}};
+    my($running)=grep{$_->{type}eq'RUNNING'}@{$r->{lifecycle}};
+    if($starting&&$running){my$ms=timestamp_ms($running->{timestamp})-timestamp_ms($starting->{timestamp});print "  Startup Duration: ".format_duration($ms)."\n" if$ms>=0}
+    elsif($starting&&!$running){print "  WARNING: Server started but never reached RUNNING state.\n"}
 }
 
-sub find_end {
-    my ($fh, $size) = @_;
-    my $offset = $size;
-    my $carry = '';
+sub print_redirect_summary {
+    my($r)=@_;print"\n  Redirect Activity Summary\n  BEGIN        END          ROLE      REDIRECTS TO         EVENTS\n  ------------ ------------ --------- -------------------- ------\n";
+    my@x=@{$r->{ranges}};my$i=0;while($i<@x){if($x[$i]{events}==1){my$s=$i;$i++while$i<@x&&$x[$i]{events}==1;my$n=$i-$s;if($n>=$singleton_threshold){print_range($x[$s]);print_range($x[$s+1])if$n>1;my%t;$t{node_name($x[$_]{norm_target})}++for$s..$i-1;my$sum=join(', ',map{"$_=$t{$_}"}sort keys%t);printf"  ... %d repetitive single-event ranges suppressed (%s) ...\n",$n-3,$sum;print_range($x[$i-1])if$n>2}else{print_range($x[$_])for$s..$i-1}}else{print_range($x[$i]);$i++}}
+}
+sub print_range { my($x)=@_;printf"  %-12s %-12s %-9s %-20s %6d\n",time_only($x->{start}),time_only($x->{end}),'MASTER',node_name($x->{norm_target}),$x->{events} }
 
-    while ($offset > 0) {
-        my $length = $offset < $block_size ? $offset : $block_size;
-        my $start = $offset - $length;
-
-        return undef unless defined sysseek($fh, $start, 0);
-        my $block = read_exact($fh, $length);
-        last if $block eq '';
-
-        my $data = $block . $carry;
-        my @timestamps = ($data =~ /$TIMESTAMP_RE/g);
-        return $timestamps[-1] if @timestamps;
-
-        $carry = length($data) > 128 ? substr($data, 0, 128) : $data;
-        $offset = $start;
+sub print_easy_incident_summary {
+    my($r)=@_;my@e=grep{$_->{type}ne'LOAD_BALANCER_WRAPPER'}sort{$a->{timestamp}cmp$b->{timestamp}||$a->{sequence}<=>$b->{sequence}}@{$r->{events}};return unless@e;
+    my(%count,%identities,%peers,%first);for my$x(@e){$count{$x->{type}}++;$first{$x->{type}}||=$x;$identities{$x->{identity}}=1 if$x->{identity};$peers{$x->{peer}}=1 if$x->{peer}}
+    print"\n  Cluster Incident Summary\n  ------------------------\n";
+    if($first{OUTCALL_TIMEOUT}){
+        print"\n  *** FIRST FAILURE DETECTED ***\n\n";
+        printf"  %s  OUTCALL TIMEOUT\n",time_only($first{OUTCALL_TIMEOUT}{timestamp});
+        print"  The outcall request did not complete in the time allotted.\n";
+        print"  This is the first indication that peer communication stopped responding.\n";
     }
-    return undef;
+    printf"\n  Window: %s -> %s\n",time_only($e[0]{timestamp}),time_only($e[-1]{timestamp});
+    printf"  %-28s %6d\n",event_label($_),$count{$_}for grep{$count{$_}}qw(OUTCALL_TIMEOUT IOM_CONTACT_LOST PEER_UPDATE_FAILURE PEER_DISCONNECT MASTER_CHANGE LOST_QUORUM NEW_OUTCALL_CONNECTION PEER_CONNECT ACHIEVED_QUORUM SYNC_FAILURE REPOSITORY_MISMATCH FAILED_REDIRECT);
+    print"  Peers: ".join(', ',sort keys%peers)."\n"if%peers;
+    print"  Affected identities: ".join(', ',sort keys%identities)."\n"if%identities;
+    print"\n  Reason Chain\n  ------------\n";
+    my@order=qw(OUTCALL_TIMEOUT IOM_CONTACT_LOST PEER_UPDATE_FAILURE PEER_DISCONNECT MASTER_CHANGE LOST_QUORUM NEW_OUTCALL_CONNECTION PEER_CONNECT ACHIEVED_QUORUM);
+    my@chain=grep{$first{$_}}@order;
+    for my$i(0..$#chain){printf"  %-12s %s",time_only($first{$chain[$i]}{timestamp}),event_label($chain[$i]);print" ($count{$chain[$i]} related)"if$count{$chain[$i]}>1;print"\n";print"               |\n               v\n"if$i<$#chain}
+    print"\n  Assessment\n  ----------\n";
+    if($first{OUTCALL_TIMEOUT}){print"  Cluster communication exceeded the allotted response time.\n"}
+    if($first{PEER_UPDATE_FAILURE}){print"  The cluster could not send updates to $first{PEER_UPDATE_FAILURE}{peer}.\n"}
+    if($first{PEER_DISCONNECT}){print"  A peer was disconnected from the cluster.\n"}
+    if($first{LOST_QUORUM}){print"  The cluster lost quorum and transitioned OFFLINE.\n"}
+    if($first{ACHIEVED_QUORUM}){print"  The cluster later achieved quorum and returned ONLINE.\n"}
 }
 
-sub timestamp_ms {
-    my ($timestamp) = @_;
-    return undef unless defined $timestamp && $timestamp =~ m{
-        ^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2}),(\d{3})$
-    }x;
-
-    my $epoch;
-    eval {
-        $epoch = timegm($6, $5, $4, $3, $2 - 1, $1);
-    };
-    return undef if $@;
-    return $epoch * 1000 + $7;
+sub print_interesting_events {
+    my($r)=@_;return unless@{$r->{favorites}}||%{$r->{suppressed}};
+    print"\n  Interesting Log Events\n  ----------------------\n";
+    my%group;for my$f(@{$r->{favorites}}){my$key=$f->{pattern};$group{$key}{count}++;$group{$key}{first}||=$f->{timestamp};$group{$key}{last}=$f->{timestamp}}
+    for my$p(sort{$group{$a}{first}cmp$group{$b}{first}}keys%group){printf"  %-12s %-12s %6d  %s\n",time_only($group{$p}{first}),time_only($group{$p}{last}),$group{$p}{count},$p}
+    if(%{$r->{suppressed}}){print"\n  Suppressed/Compacted Pattern Counts\n  -----------------------------------\n";printf"  %-6d %s\n",$r->{suppressed}{$_},$_ for sort keys%{$r->{suppressed}}}
 }
 
-sub format_duration_verbose {
-    my ($milliseconds) = @_;
-    return 'N/A' unless defined $milliseconds;
-    return 'END<BEGIN' if $milliseconds < 0;
-
-    my $days = int($milliseconds / 86400000);
-    $milliseconds %= 86400000;
-    my $hours = int($milliseconds / 3600000);
-    $milliseconds %= 3600000;
-    my $minutes = int($milliseconds / 60000);
-    $milliseconds %= 60000;
-    my $seconds = int($milliseconds / 1000);
-    my $millis = $milliseconds % 1000;
-
-    my $clock = sprintf('%02d:%02d:%02d.%03d', $hours, $minutes, $seconds, $millis);
-    return $days ? "$days+$clock" : $clock;
+sub print_verbose_events {
+    my($r)=@_;return unless@{$r->{events}};print"\n  Verbose Cluster Events\n  ----------------------\n";
+    for my$e(sort{$a->{timestamp}cmp$b->{timestamp}||$a->{sequence}<=>$b->{sequence}}@{$r->{events}}){printf"  %-12s %-24s %s\n",time_only($e->{timestamp}),$e->{type},$e->{detail};print"               Peer=$e->{peer}\n"if$e->{peer};print"               Identity=$e->{identity}\n"if$e->{identity};print"               $e->{raw}\n"}
 }
 
-sub split_timestamp {
-    my ($timestamp) = @_;
-    return ('', '') unless defined $timestamp;
-    return $1 eq '' ? ('', $timestamp) : ($1, $2) if $timestamp =~ /^(\d{4}-\d{2}-\d{2})T(.+)$/;
-    return ('', $timestamp);
+sub print_cluster_findings {
+    my@rows=@_;print"=== Cluster Findings ===\n";my@masters;for my$r(@rows){my$source=$r->{norm_host}||$r->{norm_name}||$r->{file};push@masters,map{+{%$_,source=>$source}}@{$r->{ranges}}}
+    my$reported=0;OUTER:for my$i(0..$#masters-1){for my$j($i+1..$#masters){my($a,$b)=($masters[$i],$masters[$j]);next if$a->{source}eq$b->{source};my$s=$a->{start}gt$b->{start}?$a->{start}:$b->{start};my$e=$a->{end}lt$b->{end}?$a->{end}:$b->{end};next unless defined$s&&defined$e&&$s lt$e;print"WARNING: MASTER - SPLIT BRAIN POSSIBLE\n  Overlap: ".display_timestamp($s)." -> ".display_timestamp($e)."\n  MASTER: $a->{source}\n  MASTER: $b->{source}\n  ... additional split-brain overlaps suppressed\n\n";$reported=1;last OUTER}}
+    print"No overlapping MASTER time ranges detected.\n\n"unless$reported;
 }
 
-sub normalize_host {
-    my ($host) = @_;
-    return '' unless defined $host;
-    $host =~ s/^['"]|['"]$//g;
-    $host =~ s/\s+$//;
-    $host = lc($host);
-    $host =~ s/\..*$//;
-    return $host;
+sub print_header {
+    my($elapsed,@rows)=@_;my($bytes,$redirects,$events,$masters,$slaves,$trace)=(0,0,0,0,0,0);for my$r(@rows){$bytes+=$r->{size};$redirects+=$r->{redirect_count};$events+=scalar@{$r->{events}};$trace+=$r->{trace};$r->{role}eq'MASTER'?$masters++:$slaves++}my$mb=$bytes/1048576;
+    print"logdate $VERSION\n";printf"Analyzed %d logs | %.1f MB | %d redirects | %d cluster events | %.2f sec\n\n",scalar(@rows),$mb,$redirects,$events,$elapsed;
+    print"========================================================================\nSAS Metadata Server Cluster Timeline Analysis\n========================================================================\n";
+    printf"Mode                : %s\n",$verbose?'Verbose':'Detailed';
+    printf"MASTER Nodes        : %d\nSLAVE Nodes         : %d\nTRACE Logs          : %d\n",$masters,$slaves,$trace;
+    print"SAH Lifecycle       : ENABLED\nFirst Failure       : OUTCALL TIMEOUT PRIORITIZED\nLoad Balancing      : WRAPPER COMPACTED\n";
+    printf"Elapsed Time        : %.2f sec\nMB / Second         : %.2f\n",$elapsed,$mb/$elapsed;
+    print"========================================================================\n\n";
 }
 
-sub classify_cluster {
-    my ($sample) = @_;
-    return 'NO' unless defined $sample && length $sample;
-
-    my $local_host = '';
-    if ($sample =~ /Host:\s*'([^']+)'/i) {
-        $local_host = normalize_host($1);
-    }
-    elsif ($sample =~ /SASMeta_MetadataServer_[0-9T-]+_([A-Z0-9]+)_/i) {
-        $local_host = lc($1);
-    }
-
-    my %seen_redirect;
-    my @redirect_targets;
-    while ($sample =~ /redirect(?:ing)?[^\n]{0,200}?\bat\s+([A-Za-z0-9._-]+)/ig) {
-        my $target = normalize_host($1);
-        next unless length $target;
-        push @redirect_targets, $target unless $seen_redirect{$target}++;
-    }
-
-    return 'PRI' if grep { length $local_host && $_ ne $local_host } @redirect_targets;
-    return 'NO' if @redirect_targets;
-
-    return 'PRI' if $sample =~ /\b(?:Setting the master|Changing the master|the master node|master node)\b/i;
-    return '2'   if $sample =~ /\b(?:master|primary)\b.*\b(?:secondary|standby|backup|slave)\b/i ||
-                    $sample =~ /\b(?:secondary|standby|backup|slave)\b.*\b(?:master|primary)\b/i;
-    return '3'   if $sample =~ /\b(?:third|tertiary|3rd\s+node|node\s+3)\b/i;
-
-    return 'NO';
+sub print_table {
+    my@rows=@_;printf"%-10s %-12s %-23s %-15s %-5s %-7s %-7s %-13s %-7s %s\n",'DATE','BEGIN','END','DURATION','TRACE','START','RUN','ROLE','RDIR','FILE';my$p='';
+    for my$r(@rows){my($bd,$bt)=split_timestamp($r->{begin});my($ed,$et)=split_timestamp($r->{end});my$d=($bd ne''&&$bd ne$p)?$bd:'';$p=$bd if$bd ne'';my$end=$et||'N/A';$end="$ed T $et"if$ed ne''&&$bd ne''&&$ed ne$bd;printf"%-10s %-12s %-23s %-15s %-5s %-7s %-7s %-13s %-7d %s",$d,$bt||'N/A',$end,format_duration($r->{duration_ms}),$r->{trace}?'YES':'NO',$r->{startup}?'YES':'NO',$r->{running}?'YES':'NO',$r->{role},$r->{redirect_count},$r->{file};print" [$r->{status}]"if$r->{status}ne'OK';print"\n"}
 }
 
-sub cluster_code {
-    my ($cluster) = @_;
-    return 'PRI' if defined $cluster && $cluster =~ /^(?:PRIMARY|PRI)$/i;
-    return '2'   if defined $cluster && $cluster =~ /^(?:SECONDARY|2)$/i;
-    return '3'   if defined $cluster && $cluster =~ /^(?:TERTIARY|3)$/i;
-    return 'CL'  if defined $cluster && $cluster =~ /^CLUSTERED$/i;
-    return 'NO';
-}
-
-sub print_compact {
-    my @items = @_;
-    printf "%-10s %-12s %-23s %-12s %-13s %-1s %-1s %-1s %-7s %-7s %s\n",
-        'DATE', 'BEGIN', 'END', 'DUR', 'RATIO(T+D/I)', 'T', 'S', 'R', 'STOPPED', 'CLUSTER', 'FILE';
-
-    my $previous_date = '';
-    for my $row (@items) {
-        my ($begin_date, $begin_time) = split_timestamp($row->{begin});
-        my ($end_date, $end_time)     = split_timestamp($row->{end});
-        my $display_date = ($begin_date ne '' && $begin_date ne $previous_date) ? $begin_date : '';
-        $previous_date = $begin_date if $begin_date ne '';
-
-        my $display_end = $end_time || 'N/A';
-        $display_end = "$end_date T $end_time" if ($end_date ne '' && $begin_date ne '' && $end_date ne $begin_date);
-
-        printf "%-10s %-12s %-23s %-12s %-13.2f %-1s %-1s %-1s %-7s %-7s %s",
-            $display_date,
-            $begin_time || 'N/A',
-            $display_end,
-            format_duration_verbose($row->{duration_ms}),
-            $row->{trace_ratio} || 0,
-            $row->{trace} ? 'Y' : '-',
-            $row->{startup} ? 'Y' : '-',
-            $row->{running} ? 'Y' : '-',
-            $row->{stopped} ? 'Y' : '-',
-            cluster_code($row->{cluster}),
-            $row->{file};
-
-        print " [$row->{status}]" if $row->{status} ne 'OK';
-        print "\n";
-    }
-}
-
-sub print_verbose {
-    my @items = @_;
-    printf "%-10s %-12s %-23s %-15s %-13s %-5s %-7s %-7s %-7s %-7s %s\n",
-        'DATE', 'BEGIN', 'END', 'DURATION', 'RATIO(T+D/I)', 'TRACE', 'STARTUP', 'RUNNING', 'STOPPED', 'CLUSTER', 'FILE';
-
-    my $previous_date = '';
-    for my $row (@items) {
-        my ($begin_date, $begin_time) = split_timestamp($row->{begin});
-        my ($end_date, $end_time)     = split_timestamp($row->{end});
-        my $display_date = ($begin_date ne '' && $begin_date ne $previous_date) ? $begin_date : '';
-        $previous_date = $begin_date if $begin_date ne '';
-
-        my $display_end = $end_time || 'N/A';
-        $display_end = "$end_date T $end_time" if ($end_date ne '' && $begin_date ne '' && $end_date ne $begin_date);
-
-        printf "%-10s %-12s %-23s %-15s %-13.2f %-5s %-7s %-7s %-7s %-7s %s",
-            $display_date,
-            $begin_time || 'N/A',
-            $display_end,
-            format_duration_verbose($row->{duration_ms}),
-            $row->{trace_ratio} || 0,
-            $row->{trace} ? 'YES' : 'NO',
-            $row->{startup} ? 'YES' : 'NO',
-            $row->{running} ? 'YES' : 'NO',
-            $row->{stopped} ? 'YES' : 'NO',
-            cluster_code($row->{cluster}),
-            $row->{file};
-
-        print " [$row->{status}]" if $row->{status} ne 'OK';
-        print "\n";
-    }
-}
-
-sub print_details_summary {
-    my @items = @_;
-    my ($total_files, $trace_enabled, $non_trace) = (scalar @items, 0, 0);
-    my ($total_trace, $total_debug, $total_info) = (0, 0, 0);
-
-    for my $row (@items) {
-        $total_trace += $row->{trace_count} || 0;
-        $total_debug += $row->{debug_count} || 0;
-        $total_info  += $row->{info_count}  || 0;
-        $row->{trace} ? $trace_enabled++ : $non_trace++;
-    }
-
-    print "\nTRACE determination summary\n";
-    print "Files analyzed: $total_files | TRACE-enabled: $trace_enabled | Not TRACE-enabled: $non_trace\n";
-    print "Observed sample counts: TRACE=$total_trace, DEBUG=$total_debug, INFO=$total_info\n\n";
-
-    for my $row (@items) {
-        printf "%-40s %-18s cluster=%-10s trace=%d debug=%d info=%d ratio=%.2f\n",
-            $row->{file},
-            ($row->{trace} ? 'TRACE_ENABLED' : 'NOT_TRACE_ENABLED'),
-            cluster_code($row->{cluster}),
-            $row->{trace_count} || 0,
-            $row->{debug_count} || 0,
-            $row->{info_count} || 0,
-            $row->{trace_ratio} || 0;
-    }
-    print "\n";
-}
+sub read_exact { my($fh,$n)=@_;my($b,$o)=('',0);while($o<$n){my$c=sysread($fh,$b,$n-$o,$o);last if!defined$c||$c==0;$o+=$c}return$b }
+sub find_begin { my($fh,$size)=@_;my($o,$c)=(0,'');while($o<$size){my$r=$size-$o;my$l=$r<$block_size?$r:$block_size;return undef unless defined sysseek($fh,$o,0);my$b=read_exact($fh,$l);last if$b eq'';my$d=$c.$b;return$1 if$d=~/$TIMESTAMP_RE/;$c=length($d)>128?substr($d,-128):$d;$o+=length$b}return undef }
+sub find_end { my($fh,$size)=@_;my($o,$c)=($size,'');while($o>0){my$l=$o<$block_size?$o:$block_size;my$s=$o-$l;return undef unless defined sysseek($fh,$s,0);my$b=read_exact($fh,$l);last if$b eq'';my$d=$b.$c;my@t=($d=~/$TIMESTAMP_RE/g);return$t[-1]if@t;$c=length($d)>128?substr($d,0,128):$d;$o=$s}return undef }
+sub timestamp_ms { my($t)=@_;return undef unless defined$t&&$t=~/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2}),(\d{3})$/;my$e;eval{$e=timegm($6,$5,$4,$3,$2-1,$1)};return undef if$@;return$e*1000+$7 }
+sub format_duration { my($m)=@_;return'N/A'unless defined$m;return'END<BEGIN'if$m<0;my$d=int($m/86400000);$m%=86400000;my$h=int($m/3600000);$m%=3600000;my$n=int($m/60000);$m%=60000;my$s=int($m/1000);my$x=$m%1000;my$c=sprintf'%02d:%02d:%02d.%03d',$h,$n,$s,$x;return$d?"$d+$c":$c }
+sub split_timestamp { my($t)=@_;return('','')unless defined$t;return($1,$2)if$t=~/^(\d{4}-\d{2}-\d{2})T(.+)$/;return('',$t) }
+sub normalize_host { my($h)=@_;return''unless defined$h;$h=~s/^['"]|['"]$//g;$h=~s/\s+$//;$h=lc$h;$h=~s/\..*$//;return$h }
+sub time_only { my($t)=@_;return'N/A'unless defined$t;my(undef,$x)=split_timestamp($t);$x=~tr/,/./ if defined$x;return$x||'N/A' }
+sub display_timestamp { my($t)=@_;return'N/A'unless defined$t;$t=~tr/,/./;return$t }
+sub node_name { my($h)=@_;return'None'unless defined$h&&length$h;if($h=~/(\d+)$/){my$n=0+$1;return"Node $n"if$n>=1&&$n<=3}return$h }
+sub clean_line { my($s)=@_;$s=~s/[\r\n]+$//;$s=~s/^\s+|\s+$//g;return$s }
+sub clean_value { my($s)=@_;$s=clean_line($s);$s=~s/[.]$//;return$s }
+sub event_label { my($s)=@_;$s=~s/_/ /g;return$s }

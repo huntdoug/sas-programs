@@ -13,7 +13,7 @@ use Time::HiRes qw(time);
 
 Getopt::Long::Configure('no_ignore_case');
 
-our $VERSION = '2.2.49';
+our $VERSION = '2.2.50';
 
 my ($details, $verbose, $help, $show_version) = (1, 0, 0, 0);
 my $block_size = 1024 * 1024;
@@ -523,40 +523,24 @@ sub print_node_table {
     $ip_hosts{$_->{ip}} //= ($_->{host} || $_->{name_host} || 'N/A') for grep { $_->{ip} } @rows;
 
     print "=== Server Information ===\n";
-    printf "%-4s %-4s %-8s %-20s %-15s %-4s %-14s %-34s %s\n", 'NODE', 'ROLE', 'MODE', 'HOST', 'IPV4', 'OS', 'SAS', 'KERNEL', 'COMMAND';
+    printf "%-4s %-4s %-8s %-20s %-15s %-6s %-4s %-14s %-34s %s\n", 'NODE', 'ROLE', 'MODE', 'HOST', 'IPV4', 'IPV6', 'OS', 'SAS', 'KERNEL', 'COMMAND';
     for my $summary (sort {
            node_sort_key($a->{node_conflict} ? 'conflict' : $a->{node} // 'unknown') <=> node_sort_key($b->{node_conflict} ? 'conflict' : $b->{node} // 'unknown')
         || host_key($a->{row}) cmp host_key($b->{row})
     } values %$summaries) {
         my $row = $summary->{row};
-        printf "%-4s %-4s %-8s %-20s %-15s %-4s %-14s %-34s %s\n",
+        my @host_rows = grep { host_key($_) eq host_key($summary->{row}) } @rows;
+        printf "%-4s %-4s %-8s %-20s %-15s %-6s %-4s %-14s %-34s %s\n",
             node_label($summary->{node_conflict} ? undef : $summary->{node}),
             host_role($summary, @rows),
             host_mode($summary, @rows),
             $row->{host} || $row->{name_host} || 'N/A',
             host_value($summary, \@rows, 'ip') || 'N/A',
+            (grep { $_->{ipv6_loopback} } @host_rows) ? '::1' : '-',
             short_os($row->{os}),
             short_sas($row->{sas_version}),
             $row->{release} || 'N/A',
             short_command($row->{command});
-    }
-
-    print "\n=== Server Network ===\n";
-    printf "%-4s %-20s %-8s %-8s %-22s %s\n", 'NODE', 'HOST', 'IPV6', 'LISTEN', 'METADATA PEERS', 'FLAGS';
-    for my $summary (sort {
-           node_sort_key($a->{node_conflict} ? 'conflict' : $a->{node} // 'unknown') <=> node_sort_key($b->{node_conflict} ? 'conflict' : $b->{node} // 'unknown')
-        || host_key($a->{row}) cmp host_key($b->{row})
-    } values %$summaries) {
-        my @host_rows = grep { host_key($_) eq host_key($summary->{row}) } @rows;
-        my %peers;
-        $peers{$ip_hosts{$_} || $_} = 1 for map { @{$_->{peer_ips}} } @host_rows;
-        printf "%-4s %-20s %-8s %-8s %-22s %s\n",
-            node_label($summary->{node_conflict} ? undef : $summary->{node}),
-            $summary->{row}{host} || $summary->{row}{name_host} || 'N/A',
-            (grep { $_->{ipv6_loopback} } @host_rows) ? '::1' : '-',
-            (grep { $_->{ipv6_listen} } @host_rows) ? 'IPv6' : '-',
-            join(', ', sort keys %peers) || '-',
-            join(', ', host_flags($summary, @host_rows)) || '-';
     }
 }
 

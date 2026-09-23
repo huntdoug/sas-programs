@@ -11,7 +11,7 @@ use Getopt::Long qw(GetOptions);
 use Time::Local qw(timegm);
 use Time::HiRes qw(time);
 
-our $VERSION = '2.2.40';
+our $VERSION = '2.2.41';
 
 my ($details, $verbose, $help, $show_version) = (1, 0, 0, 0);
 my $block_size = 1024 * 1024;
@@ -309,7 +309,7 @@ sub apply_scan {
     $r->{redirect_hosts}=join(', ',@raw)if@raw;$r->{norm_redirects}=join(', ',@norm)if@norm;
 }
 
-sub cluster_role { my($row)=@_;return'N'if$row->{no_cluster}||!$row->{clustered};return'M'if defined$row->{node_number}&&defined$row->{master_node}&&$row->{node_number}==$row->{master_node};return'S' }
+sub cluster_role { my($row)=@_;return'N'if$row->{no_cluster}||!$row->{clustered};return'M'if defined$row->{node}&&length$row->{node}&&defined$row->{master_node}&&length$row->{master_node}&&$row->{node}==$row->{master_node};return'S' }
 
 sub assign_node_numbers {
     my @rows = @_;

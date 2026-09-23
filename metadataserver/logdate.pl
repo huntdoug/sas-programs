@@ -11,7 +11,7 @@ use Getopt::Long qw(GetOptions);
 use Time::Local qw(timegm);
 use Time::HiRes qw(time);
 
-our $VERSION = '2.2.30';
+our $VERSION = '2.2.31';
 
 my ($details, $verbose, $help, $show_version) = (1, 0, 0, 0);
 my $block_size = 1024 * 1024;
@@ -67,27 +67,8 @@ $elapsed = 0.000001 if $elapsed <= 0;
 $details ? print_header($elapsed, @rows) : print "logdate $VERSION\n\n";
 print_table(@rows);
 print "\n";
-
-print "=== Per-Log Analysis ===\n";
-for my $r (@rows) {
-    print "FILE: $r->{file}\n";
-    print "  Host: '$r->{host}'\n" if $r->{host};
-    print "  OS: '$r->{os}'\n" if $r->{os};
-    print "  Release: '$r->{release}'\n" if $r->{release};
-    print "  SAS Version: '$r->{sas_version}'\n" if $r->{sas_version};
-    print "  Command: '$r->{command}'\n" if $r->{command};
-    print "  Filename Host: $r->{name_host}  ->  $r->{norm_name}\n" if $r->{name_host};
-    print "  Redirect Target(s): $r->{redirect_hosts}  ->  $r->{norm_redirects}\n" if $r->{redirect_hosts};
-
-    if ($details) {
-        print_server_lifecycle($r);
-        print_redirect_summary($r) if $r->{redirect_count};
-        print_easy_incident_summary($r);
-        print_interesting_events($r);
-        print_verbose_events($r) if $verbose;
-    }
-    print "\n";
-}
+print_node_table(@rows);
+print "\n";
 
 print_cluster_findings(@rows) if $details;
 exit 0;
@@ -391,6 +372,20 @@ sub print_table {
     my@rows=@_;my$p='';my$prefix=$details?'':common_prefix(map{$_->{file}}@rows);
     printf"%-10s %-8s %-18s %-15s %-5s %-7s %-7s %-8s %-13s %-7s %s\n",'DATE','BEGIN','END','DURATION','TRACE','START','RUN','STOPPED','ROLE','RDIR','FILE';
     for my$r(@rows){my($bd,$bt)=split_timestamp($r->{begin});my($ed,$et)=split_timestamp($r->{end});my$d=($bd ne''&&$bd ne$p)?display_table_date($bd):'';$p=$bd if$bd ne'';my$end=$et||'N/A';$end="$ed T $et"if$ed ne''&&$bd ne''&&$ed ne$bd;my$file=$r->{file};$file=substr($file,length$prefix)if length$prefix;printf"%-10s %-8s %-18s %-15s %-5s %-7s %-7s %-8s %-13s %-7d %s",$d,table_time($bt),table_time($end),format_duration($r->{duration_ms}),$r->{trace}?'YES':'NO',$r->{startup}?'YES':'NO',$r->{running}?'YES':'NO',$r->{stopped}?'YES':'NO',$r->{role},$r->{redirect_count},$file;print" [$r->{status}]"if$r->{status}ne'OK';print"\n"}
+}
+
+sub print_node_table {
+    my @rows = @_;
+    print "=== Server Information ===\n";
+    printf "%-20s %-12s %-34s %-20s %s\n", 'HOST', 'OS', 'KERN', 'SAS VERSION', 'COMMAND';
+    for my $row (@rows) {
+        printf "%-20s %-12s %-34s %-20s %s\n",
+            $row->{host} || $row->{name_host} || 'N/A',
+            $row->{os} || 'N/A',
+            $row->{release} || 'N/A',
+            $row->{sas_version} || 'N/A',
+            $row->{command} || 'N/A';
+    }
 }
 
 sub table_time { my($value)=@_;return'N/A'unless defined$value&&length$value;$value=~s/,\d{3}\b//;return$value }

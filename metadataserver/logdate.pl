@@ -11,7 +11,7 @@ use Getopt::Long qw(GetOptions);
 use Time::Local qw(timegm);
 use Time::HiRes qw(time);
 
-our $VERSION = '2.2.29';
+our $VERSION = '2.2.30';
 
 my ($details, $verbose, $help, $show_version) = (1, 0, 0, 0);
 my $block_size = 1024 * 1024;
@@ -65,6 +65,8 @@ usage(1, 'no readable log files supplied') unless @rows;
 my $elapsed = time() - $started;
 $elapsed = 0.000001 if $elapsed <= 0;
 $details ? print_header($elapsed, @rows) : print "logdate $VERSION\n\n";
+print_table(@rows);
+print "\n";
 
 print "=== Per-Log Analysis ===\n";
 for my $r (@rows) {
@@ -76,9 +78,6 @@ for my $r (@rows) {
     print "  Command: '$r->{command}'\n" if $r->{command};
     print "  Filename Host: $r->{name_host}  ->  $r->{norm_name}\n" if $r->{name_host};
     print "  Redirect Target(s): $r->{redirect_hosts}  ->  $r->{norm_redirects}\n" if $r->{redirect_hosts};
-    print "  Classification: $r->{role}\n";
-    print "  Stopped: " . ($r->{stopped} ? 'YES' : 'NO') . "\n";
-    print "  Redirects: $r->{redirect_count}\n";
 
     if ($details) {
         print_server_lifecycle($r);
@@ -91,7 +90,6 @@ for my $r (@rows) {
 }
 
 print_cluster_findings(@rows) if $details;
-print_table(@rows);
 exit 0;
 
 sub usage {

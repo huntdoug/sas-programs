@@ -11,7 +11,7 @@ use Getopt::Long qw(GetOptions);
 use Time::Local qw(timegm);
 use Time::HiRes qw(time);
 
-our $VERSION = '2.2.39';
+our $VERSION = '2.2.40';
 
 my ($details, $verbose, $help, $show_version) = (1, 0, 0, 0);
 my $block_size = 1024 * 1024;
@@ -78,7 +78,7 @@ print_node_table(@rows);
 print "\n";
 print_table(@rows);
 print "\n";
-print_cluster_visual(@rows) if $details;
+print_cluster_state_report(@rows) if $details;
 print_cluster_timeline(@rows) if $details;
 
 print_cluster_findings(@rows) if $details;
@@ -493,6 +493,145 @@ sub print_node_table {
     }
 }
 
+sub print_cluster_state_report {
+    my @rows = @_;
+    my @entries = cluster_state_entries(@rows);
+    return unless @entries;
+
+    my (%state, %claimed_master, @snapshots, @stale_redirects);
+    my ($master, $quorum) = ('', 'UNKNOWN');
+    my @groups;
+    for my $entry (@entries) {
+        my $time = short_timestamp($entry->{timestamp});
+        if (!@groups || $groups[-1]{time} ne $time) {
+            push @groups, { time => $time, entries => [] };
+        }
+        push @{$groups[-1]{entries}}, $entry;
+    }
+
+    print "=== Cluster State ===\n";
+    for my $group (@groups) {
+        my (%labels, $changed);
+        for my $entry (@{$group->{entries}}) {
+            my $row = $entry->{row};
+            my $node = $row->{node};
+            my $type = $entry->{type};
+            my $label = '';
+
+            if ($type eq 'PEER_CONNECT') {
+                $state{$node} = 'O' if defined $node;
+                $label = node_label($node) . ' joined';
+                $changed = 1;
+            }
+            elsif ($type eq 'PEER_DISCONNECT') {
+                $state{$node} = 'X' if defined $node;
+                $label = node_label($node) . ' left';
+                $changed = 1;
+            }
+            elsif ($type eq 'MASTER_CHANGE') {
+                my $next_master = master_for_event($row, $entry->{event});
+                if (defined $next_master) {
+                    my $master_changed = !length($master) || $master != $next_master;
+                    $master = $next_master;
+                    $claimed_master{$node} = $next_master if defined $node;
+                    $label = 'master=' . node_label($next_master) if $master_changed;
+                    $changed ||= $master_changed;
+                }
+            }
+            elsif ($type eq 'ACHIEVED_QUORUM' || $type eq 'LOST_QUORUM') {
+                my $next_quorum = $type eq 'ACHIEVED_QUORUM' ? 'ONLINE' : 'OFFLINE';
+                my $quorum_changed = $quorum ne $next_quorum;
+                $quorum = $next_quorum;
+                $label = 'quorum ' . $quorum if $quorum_changed;
+                $changed ||= $quorum_changed;
+            }
+            elsif ($type eq 'SYNC_NEEDED') {
+                $label = node_label($node) . ' synchronization needed';
+            }
+            elsif ($type eq 'SYNC_FAILURE') {
+                $label = node_label($node) . ' synchronization failed';
+            }
+            elsif ($type eq 'REDIRECT') {
+                my $target = $entry->{redirect}{node_number};
+                if (defined $node && defined $target && defined $master && length $master && $node != $master && $claimed_master{$node} && $claimed_master{$node} == $node && $quorum eq 'ONLINE') {
+                    push @stale_redirects, { timestamp => $entry->{timestamp}, source => $node, target => $target };
+                }
+                next;
+            }
+            $labels{$label} = 1 if length $label;
+        }
+
+        print "  $group->{time}  " . join('; ', sort keys %labels) . "\n" if %labels;
+        if ($changed) {
+            push @snapshots, {
+                time => $group->{time}, master => $master, quorum => $quorum,
+                state => { %state },
+            };
+        }
+    }
+    print "\n";
+    print_cluster_state_graph(\@snapshots, \@rows);
+    print_stale_redirect_warnings(@stale_redirects);
+}
+
+sub cluster_state_entries {
+    my @rows = @_;
+    my %types = map { $_ => 1 } qw(PEER_CONNECT PEER_DISCONNECT MASTER_CHANGE ACHIEVED_QUORUM LOST_QUORUM SYNC_NEEDED SYNC_FAILURE);
+    my @entries;
+    for my $row (@rows) {
+        push @entries, map { { timestamp => $_->{timestamp}, sequence => $_->{sequence}, type => $_->{type}, event => $_, row => $row } }
+            grep { $types{$_->{type}} } @{$row->{events}};
+        push @entries, map { { timestamp => $_->{timestamp}, sequence => $_->{sequence}, type => 'REDIRECT', redirect => $_, row => $row } }
+            @{$row->{redirects}};
+    }
+    return sort {
+           $a->{timestamp} cmp $b->{timestamp}
+        || $a->{sequence} <=> $b->{sequence}
+        || $a->{row}{file} cmp $b->{row}{file}
+    } @entries;
+}
+
+sub print_cluster_state_graph {
+    my ($snapshots, $rows) = @_;
+    return unless @$snapshots;
+    my @display = @$snapshots;
+    my $omitted = @display > 8 ? @display - 8 : 0;
+    @display = (@display[0 .. 3], @display[-4 .. -1]) if $omitted;
+    my @nodes = sort { $a <=> $b } grep { defined } map { $_->{node} } @$rows;
+    my %node_seen;
+    @nodes = grep { !$node_seen{$_}++ } @nodes;
+
+    print "=== Cluster State Graph ===\n";
+    printf "%-8s", 'TIME';
+    printf " %-9s", graph_time($_->{time}) for @display;
+    print "\n";
+    for my $node (@nodes) {
+        printf "N%-7s", $node;
+        printf " %-9s", $_->{state}{$node} || '.' for @display;
+        print "\n";
+    }
+    printf "%-8s", 'QUORUM';
+    printf " %-9s", $_->{quorum} eq 'UNKNOWN' ? '?' : $_->{quorum} for @display;
+    print "\n";
+    printf "%-8s", 'MASTER';
+    printf " %-9s", length $_->{master} ? node_label($_->{master}) : '-' for @display;
+    print "\n";
+    print "  O=joined/online X=left/offline .=no state observed\n";
+    print "  ... $omitted intermediate state changes omitted\n" if $omitted;
+    print "\n";
+}
+
+sub print_stale_redirect_warnings {
+    my @warnings = @_;
+    return unless @warnings;
+    print "=== Stale Master Redirects ===\n";
+    for my $warning (@warnings) {
+        printf "  %s  %s redirected clients to %s while another master held quorum\n",
+            short_timestamp($warning->{timestamp}), node_label($warning->{source}), node_label($warning->{target});
+    }
+    print "\n";
+}
+
 sub print_cluster_timeline {
     my @rows = @_;
     my %node_hosts;
@@ -576,6 +715,10 @@ sub print_cluster_visual {
 }
 
 sub node_from_text { my($text)=@_;return undef unless defined$text;return$1 if$text=~/\bNode\s+(\d+)\b/i;return undef }
+sub node_label { my($node)=@_;return defined $node ? "N$node" : 'N?' }
+sub master_for_event { my($row,$event)=@_;return node_from_text($event->{peer}) // $row->{master_node} // $row->{node} }
+sub short_timestamp { my($timestamp)=@_;return'N/A'unless defined$timestamp;$timestamp=~s/^\d{4}-//;$timestamp=~s/T/ /;$timestamp=~s/,\d{3}$//;return$timestamp }
+sub graph_time { my($timestamp)=@_;return'N/A'unless defined$timestamp;$timestamp=~s/^\d{2}-\d{2}\s+//;return$timestamp }
 sub node_sort_key { my($node)=@_;return$node if$node=~/^\d+$/;return 9998 if$node eq'conflict';return 9999 }
 sub timeline_time { my($timestamp)=@_;return'N/A'unless defined$timestamp;$timestamp=~s/T/ /;$timestamp=~s/,\d{3}$//;return$timestamp }
 sub timeline_label { my($type)=@_;my%labels=(PEER_CONNECT=>'JOIN CLUSTER',PEER_DISCONNECT=>'LEAVE CLUSTER',MASTER_CHANGE=>'MASTER CHANGE',LOST_QUORUM=>'QUORUM LOST',ACHIEVED_QUORUM=>'QUORUM ONLINE',SYNC_NEEDED=>'SYNC NEEDED',SYNC_FAILURE=>'SYNC FAILURE',REPOSITORY_MISMATCH=>'REPOSITORY MISMATCH',FAILED_REDIRECT=>'REDIRECT FAILED');return$labels{$type}||event_label($type) }

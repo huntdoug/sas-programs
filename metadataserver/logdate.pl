@@ -13,7 +13,7 @@ use Time::HiRes qw(time);
 
 Getopt::Long::Configure('no_ignore_case');
 
-our $VERSION = '2.2.44';
+our $VERSION = '2.2.46';
 
 my ($details, $verbose, $help, $show_version) = (1, 0, 0, 0);
 my $block_size = 1024 * 1024;
@@ -178,7 +178,7 @@ sub analyze_file {
         duration_ms=>undef, host=>'', ip=>'', peer_ips=>[], norm_host=>'', name_host=>'', norm_name=>'',
         os=>'', release=>'', sas_version=>'', command=>'', trace=>0,
         trace_count=>0, debug_count=>0, info_count=>0, trace_ratio=>0,
-        startup=>0, running=>0, stopped=>0, clustered=>0, no_cluster=>0,
+        startup=>0, running=>0, stopped=>0, clustered=>0, not_master=>0, backup_completed=>0, normal=>0, no_cluster=>0,
         node=>'', node_number=>undef, master_node=>undef,
         lifecycle=>[], sample_redirect_count=>0,
         redirects=>[], redirect_count=>0, redirect_hosts=>'', norm_redirects=>'',
@@ -228,7 +228,9 @@ sub analyze_sample {
     }elsif($s=~/Host:\s*'([^']+)'/i){$r->{host}=$1;$r->{norm_host}=normalize_host($1)}
         $r->{ip}=$1 if $s=~/Server is executing on host\s+[^\s]+\s+\(([0-9.]+)\)/i;
     if($file=~/SASMeta_MetadataServer_[0-9T-]+_([A-Z0-9]+)_/i){$r->{name_host}=$1;$r->{norm_name}=normalize_host($1)}
-    $r->{sample_redirect_count}=()=$s=~/redirect(?:ing)?[^\n]{0,500}?\bat\s+[A-Za-z0-9._-]+/ig;
+    my $local_host = $r->{norm_host} || $r->{norm_name};
+    my @sample_redirects = ($s =~ /redirect(?:ing)?[^\n]{0,500}?\bat\s+([A-Za-z0-9._-]+)/ig);
+    $r->{sample_redirect_count} = scalar grep { !length($local_host) || normalize_host($_) ne $local_host } @sample_redirects;
     $r->{trace_count}=()=$s=~/^\d{4}-.*?\bTRACE\b/mg;
     $r->{debug_count}=()=$s=~/^\d{4}-.*?\bDEBUG\b/mg;
     $r->{info_count}=()=$s=~/^\d{4}-.*?\bINFO\b/mg;
@@ -237,6 +239,8 @@ sub analyze_sample {
                           $s=~/\bConnecting server\b.*?\bto cluster\b/i ||
                           $s=~/\bThe cluster has (?:achieved|lost) quorum\b/i;
     $r->{master_node}=$1 if $s=~/\bSetting the master node to\b.*?\bNode\s+(\d+)\b/i;
+    $r->{not_master}=1 if $s=~/scheduled backup was not run.*not the master node/i;
+    $r->{backup_completed}=1 if $s=~/The Backup has completed successfully/i;
     $r->{no_cluster}=1 if $s=~/\bstartNoCluster\b/i;
     my$signal=$r->{trace_count}+$r->{debug_count};$r->{trace_ratio}=$signal/($r->{info_count}+1);
     $r->{trace}=($signal>0&&$signal>$r->{info_count})?1:0;
@@ -294,6 +298,7 @@ sub classify_event {
     elsif($line=~/Changing the master/i){($type,$detail)=('CHANGING_MASTER','Changing the master.')}
     elsif($line=~/cluster has lost quorum.*OFFLINE/i){($type,$detail)=('LOST_QUORUM','Cluster lost quorum and is now OFFLINE.')}
     elsif($line=~/cluster has achieved quorum.*ONLINE/i){($type,$detail)=('ACHIEVED_QUORUM','Cluster achieved quorum and is now ONLINE.')}
+    elsif($line=~/The Backup has completed successfully/i){($type,$detail)=('BACKUP_COMPLETED','Scheduled backup completed successfully.')}
     elsif($line=~/scheduled backup was not run.*not the master node/i){($type,$detail)=('NOT_MASTER_BACKUP','Scheduled backup skipped because this node is not master.')}
     elsif($line=~/New out call client connection/i){($type,$detail)=('NEW_OUTCALL_CONNECTION','New peer out-call connection.')}
     elsif($line=~/Some updates are needed to make the metadata on server.*current/i){($type,$detail)=('SYNC_NEEDED','Metadata synchronization is required.')}
@@ -307,19 +312,24 @@ sub classify_event {
 
 sub apply_scan {
     my($r,$scan)=@_;
-    $r->{redirects}=$scan->{redirects};$r->{redirect_count}=scalar@{$scan->{redirects}};
+    my $local_host = $r->{norm_host} || $r->{norm_name};
+    my @redirects = grep { !length($local_host) || $_->{norm_target} ne $local_host } @{$scan->{redirects}};
+    $r->{redirects}=\@redirects;$r->{redirect_count}=scalar@redirects;
     $r->{events}=$scan->{events};$r->{favorites}=$scan->{favorites};
     $r->{lifecycle}=$scan->{lifecycle};$r->{suppressed}=$scan->{suppressed};
     $r->{peer_ips}=$scan->{peer_ips};
     $r->{master_node}=$scan->{master_node} if defined $scan->{master_node};
-    $r->{clustered}=1 if defined $r->{master_node};
+    $r->{not_master}=1 if grep { $_->{type} eq 'NOT_MASTER_BACKUP' } @{$r->{events}};
+    $r->{backup_completed}=1 if grep { $_->{type} eq 'BACKUP_COMPLETED' } @{$r->{events}};
+    $r->{clustered}=1 if defined $r->{master_node} || $r->{not_master};
+    $r->{normal}=1 if $r->{backup_completed} && !$r->{not_master} && !$r->{redirect_count} && !$r->{clustered};
     $r->{startup}=scalar(grep{$_->{type}eq'STARTING'}@{$r->{lifecycle}})?1:0;
     $r->{running}=scalar(grep{$_->{type}eq'RUNNING'}@{$r->{lifecycle}})?1:0;
     my(%seen,@raw,@norm);for my$e(@{$r->{redirects}}){next if$seen{$e->{norm_target}}++;push@raw,$e->{target};push@norm,$e->{norm_target}}
     $r->{redirect_hosts}=join(', ',@raw)if@raw;$r->{norm_redirects}=join(', ',@norm)if@norm;
 }
 
-sub cluster_role { my($row)=@_;return'N'if$row->{no_cluster}||!$row->{clustered};return'M'if defined$row->{node}&&length$row->{node}&&defined$row->{master_node}&&length$row->{master_node}&&$row->{node}==$row->{master_node};return'S' }
+sub cluster_role { my($row)=@_;return'N'if$row->{normal}||$row->{no_cluster}||!$row->{clustered};return'S'if$row->{not_master};return'M'if defined$row->{node}&&length$row->{node}&&defined$row->{master_node}&&length$row->{master_node}&&$row->{node}==$row->{master_node};return'S' }
 
 sub assign_node_numbers {
     my @rows = @_;
@@ -528,8 +538,8 @@ sub print_marker_summary {
     $ip_hosts{$_->{ip}} //= ($_->{host} || $_->{name_host} || 'N/A') for grep { $_->{ip} } @rows;
 
     print "=== Cluster Markers ===\n";
-    printf "%-4s %-20s %3s %3s %4s %4s %3s %3s %3s %4s %4s %4s %s\n",
-        'NODE', 'HOST', 'ST', 'RUN', 'JOIN', 'LEFT', 'MST', 'Q+', 'Q-', 'RDIR', 'SYNC', 'LB', 'METADATA PEERS';
+    printf "%-4s %-20s %3s %3s %4s %4s %3s %3s %3s %4s %4s %4s %4s %4s %s\n",
+        'NODE', 'HOST', 'ST', 'RUN', 'JOIN', 'LEFT', 'MST', 'Q+', 'Q-', 'RDIR', 'SYNC', 'LB', 'BKP', 'BOK', 'METADATA PEERS';
 
     for my $summary (sort {
            node_sort_key($a->{node_conflict} ? 'conflict' : $a->{node} // 'unknown') <=> node_sort_key($b->{node_conflict} ? 'conflict' : $b->{node} // 'unknown')
@@ -548,14 +558,16 @@ sub print_marker_summary {
                 $counts{'Q-'} += $event->{type} eq 'LOST_QUORUM';
                 $counts{SYNC} += $event->{type} eq 'SYNC_NEEDED' || $event->{type} eq 'SYNC_FAILURE';
                 $counts{LB}   += $event->{type} eq 'LOAD_BALANCER_WRAPPER';
+                $counts{BKP}  += $event->{type} eq 'NOT_MASTER_BACKUP';
+                $counts{BOK}  += $event->{type} eq 'BACKUP_COMPLETED';
             }
             $counts{RDIR} += $row->{redirect_count};
             $peers{$ip_hosts{$_} || $_} = 1 for @{$row->{peer_ips}};
         }
-        printf "%-4s %-20s %3d %3d %4d %4d %3d %3d %3d %4d %4d %4d %s\n",
+        printf "%-4s %-20s %3d %3d %4d %4d %3d %3d %3d %4d %4d %4d %4d %4d %s\n",
             $summary->{node_conflict} ? '?' : $summary->{node} // '-',
             $summary->{row}{host} || $summary->{row}{name_host} || 'N/A',
-            (map { $counts{$_} || 0 } qw(ST RUN JOIN LEFT MST Q+ Q- RDIR SYNC LB)),
+            (map { $counts{$_} || 0 } qw(ST RUN JOIN LEFT MST Q+ Q- RDIR SYNC LB BKP BOK)),
             join(', ', sort keys %peers) || '-';
     }
 }
@@ -634,6 +646,9 @@ sub print_cluster_state_report {
             elsif ($type eq 'NOT_MASTER_BACKUP') {
                 $label = node_label($node) . ' backup skipped (not master)';
             }
+            elsif ($type eq 'BACKUP_COMPLETED') {
+                $label = node_label($node) . ' backup completed';
+            }
             elsif ($type eq 'REDIRECT') {
                 my $target = $entry->{redirect}{node_number};
                 if (defined $node && defined $target && defined $master && length $master && $node != $master && $claimed_master{$node} && $claimed_master{$node} == $node && $quorum eq 'ONLINE') {
@@ -659,7 +674,7 @@ sub print_cluster_state_report {
 
 sub cluster_state_entries {
     my @rows = @_;
-    my %types = map { $_ => 1 } qw(PEER_CONNECT PEER_DISCONNECT MASTER_CHANGE ACHIEVED_QUORUM LOST_QUORUM SYNC_NEEDED SYNC_FAILURE LOAD_BALANCER_WRAPPER NOT_MASTER_BACKUP);
+    my %types = map { $_ => 1 } qw(PEER_CONNECT PEER_DISCONNECT MASTER_CHANGE ACHIEVED_QUORUM LOST_QUORUM SYNC_NEEDED SYNC_FAILURE LOAD_BALANCER_WRAPPER NOT_MASTER_BACKUP BACKUP_COMPLETED);
     my @entries;
     for my $row (@rows) {
         push @entries, map { { timestamp => $_->{timestamp}, sequence => $_->{sequence}, type => $_->{type}, event => $_, row => $row } } @{$row->{lifecycle}};

@@ -11,7 +11,7 @@ use Getopt::Long qw(GetOptions);
 use Time::Local qw(timegm);
 use Time::HiRes qw(time);
 
-our $VERSION = '2.2.32';
+our $VERSION = '2.2.34';
 
 my ($details, $verbose, $help, $show_version) = (1, 0, 0, 0);
 my $block_size = 1024 * 1024;
@@ -77,6 +77,7 @@ print_table(@rows);
 print "\n";
 print_node_table(@rows);
 print "\n";
+print_cluster_timeline(@rows) if $details;
 
 print_cluster_findings(@rows) if $details;
 exit 0;
@@ -172,7 +173,9 @@ sub analyze_file {
         duration_ms=>undef, host=>'', norm_host=>'', name_host=>'', norm_name=>'',
         os=>'', release=>'', sas_version=>'', command=>'', trace=>0,
         trace_count=>0, debug_count=>0, info_count=>0, trace_ratio=>0,
-        startup=>0, running=>0, stopped=>0, clustered=>0, no_cluster=>0, node=>'', lifecycle=>[], sample_redirect_count=>0,
+        startup=>0, running=>0, stopped=>0, clustered=>0, no_cluster=>0,
+        node=>'', node_number=>undef, master_node=>undef,
+        lifecycle=>[], sample_redirect_count=>0,
         redirects=>[], redirect_count=>0, redirect_hosts=>'', norm_redirects=>'',
         ranges=>[], events=>[], favorites=>[], suppressed=>{},
         role=>'UNKNOWN', status=>'OK',
@@ -224,7 +227,11 @@ sub analyze_sample {
     $r->{debug_count}=()=$s=~/^\d{4}-.*?\bDEBUG\b/mg;
     $r->{info_count}=()=$s=~/^\d{4}-.*?\bINFO\b/mg;
     $r->{stopped}=1 if $s=~/\bState,\s*stopped\b/i;
-    $r->{clustered}=1 if $s=~/\bCluster\s+SASMeta\s*-\s*Logical Metadata Server\b/i;
+    $r->{clustered}=1 if $s=~/\bCluster\s+SASMeta\s*-\s*Logical Metadata Server\b/i ||
+                          $s=~/\bConnecting server\b.*?\bto cluster\b/i ||
+                          $s=~/\bThe cluster has (?:achieved|lost) quorum\b/i;
+    $r->{node_number}=$1 if $s=~/\bConnecting server\b.*?\bNode\s+(\d+)\s+to\s+cluster\b/i;
+    $r->{master_node}=$1 if $s=~/\bSetting the master node to\b.*?\bNode\s+(\d+)\b/i;
     $r->{no_cluster}=1 if $s=~/\bstartNoCluster\b/i;
     my$signal=$r->{trace_count}+$r->{debug_count};$r->{trace_ratio}=$signal/($r->{info_count}+1);
     $r->{trace}=($signal>0&&$signal>$r->{info_count})?1:0;
@@ -232,7 +239,7 @@ sub analyze_sample {
 
 sub scan_log {
     my($fh,$file,$collect)=@_;
-    my(@redirects,@events,@favorites,@lifecycle,%suppressed);
+    my(@redirects,@events,@favorites,@lifecycle,%suppressed,$node_number,$master_node);
     return{redirects=>[],events=>[],favorites=>[],lifecycle=>[],suppressed=>{}}
         unless defined sysseek($fh,0,0);
     my($ts,$seq)=(undef,0);
@@ -251,6 +258,8 @@ sub scan_log {
         if($line=~/\bSAH011999I\b.*?\bState,\s*running\b/i){
             push@lifecycle,{timestamp=>$ts,type=>'RUNNING',code=>'SAH011999I',sequence=>$seq++};
         }
+        $node_number=$1 if $line=~/\bConnecting server\b.*?\bNode\s+(\d+)\s+to\s+cluster\b/i;
+        $master_node=$1 if $line=~/\bSetting the master node to\b.*?\bNode\s+(\d+)\b/i;
 
         next unless$collect;
         my$event=classify_event($ts,$line,$seq++);push@events,$event if$event;
@@ -259,7 +268,7 @@ sub scan_log {
         my$favorite=matches_any($line,@favorite_patterns ? @favorite_patterns : default_favorites());
         push@favorites,{timestamp=>$ts,pattern=>$favorite,text=>clean_line($line),sequence=>$seq++} if$favorite;
     }
-    return{redirects=>\@redirects,events=>\@events,favorites=>\@favorites,lifecycle=>\@lifecycle,suppressed=>\%suppressed};
+    return{redirects=>\@redirects,events=>\@events,favorites=>\@favorites,lifecycle=>\@lifecycle,suppressed=>\%suppressed,node_number=>$node_number,master_node=>$master_node};
 }
 
 sub matches_any { my($line,@patterns)=@_;for my$p(@patterns){return$p if eval{$line=~/$p/i}}return'' }
@@ -277,6 +286,7 @@ sub classify_event {
     elsif($line=~/cluster has lost quorum.*OFFLINE/i){($type,$detail)=('LOST_QUORUM','Cluster lost quorum and is now OFFLINE.')}
     elsif($line=~/cluster has achieved quorum.*ONLINE/i){($type,$detail)=('ACHIEVED_QUORUM','Cluster achieved quorum and is now ONLINE.')}
     elsif($line=~/New out call client connection/i){($type,$detail)=('NEW_OUTCALL_CONNECTION','New peer out-call connection.')}
+    elsif($line=~/Some updates are needed to make the metadata on server.*current/i){($type,$detail)=('SYNC_NEEDED','Metadata synchronization is required.')}
     elsif($line=~/Attempts to synchronize the metadata on this node.*failed/i){($type,$detail)=('SYNC_FAILURE','Metadata synchronization failed.')}
     elsif($line=~/most recent update on the connecting server.*not one of the updates/i){($type,$detail)=('REPOSITORY_MISMATCH','Connecting server update does not match cluster.')}
     elsif($line=~/failed to redirect/i){($type,$detail)=('FAILED_REDIRECT','Client redirect failed.')}
@@ -290,27 +300,27 @@ sub apply_scan {
     $r->{redirects}=$scan->{redirects};$r->{redirect_count}=scalar@{$scan->{redirects}};
     $r->{events}=$scan->{events};$r->{favorites}=$scan->{favorites};
     $r->{lifecycle}=$scan->{lifecycle};$r->{suppressed}=$scan->{suppressed};
+    $r->{node_number}=$scan->{node_number} if defined $scan->{node_number};
+    $r->{master_node}=$scan->{master_node} if defined $scan->{master_node};
+    $r->{clustered}=1 if defined $r->{node_number} || defined $r->{master_node};
     $r->{startup}=scalar(grep{$_->{type}eq'STARTING'}@{$r->{lifecycle}})?1:0;
     $r->{running}=scalar(grep{$_->{type}eq'RUNNING'}@{$r->{lifecycle}})?1:0;
     my(%seen,@raw,@norm);for my$e(@{$r->{redirects}}){next if$seen{$e->{norm_target}}++;push@raw,$e->{target};push@norm,$e->{norm_target}}
     $r->{redirect_hosts}=join(', ',@raw)if@raw;$r->{norm_redirects}=join(', ',@norm)if@norm;
 }
 
-sub cluster_role { my($row)=@_;return'N'if$row->{no_cluster}||!$row->{clustered};return$row->{redirect_count}?'M':'S' }
+sub cluster_role { my($row)=@_;return'N'if$row->{no_cluster}||!$row->{clustered};return'M'if defined$row->{node_number}&&defined$row->{master_node}&&$row->{node_number}==$row->{master_node};return'S' }
 
 sub assign_node_numbers {
     my @rows = @_;
     my %hosts;
     for my $row (@rows) {
         my $host = $row->{norm_host} || $row->{norm_name} || $row->{file};
-        $hosts{$host} = 1;
+        $hosts{$host} //= $row;
     }
-    my %nodes;
-    my $number = 1;
-    $nodes{$_} = $number++ for sort keys %hosts;
     for my $row (@rows) {
         my $host = $row->{norm_host} || $row->{norm_name} || $row->{file};
-        $row->{node} = $nodes{$host};
+        $row->{node} = $hosts{$host}{node_number};
     }
 }
 
@@ -411,10 +421,12 @@ sub print_node_table {
         my $host = $row->{norm_host} || $row->{norm_name} || $row->{file};
         $hosts{$host} //= $row;
     }
-    for my $host (sort keys %hosts) {
-        my $row = $hosts{$host};
+    my %nodes;
+    $nodes{defined $_->{node} ? $_->{node} : 'unknown'} //= $_ for values %hosts;
+    for my $node (sort { $a eq 'unknown' ? 1 : $b eq 'unknown' ? -1 : $a <=> $b } keys %nodes) {
+        my $row = $nodes{$node};
         printf "%-4s %-7s %-20s %-12s %-34s %-20s %s\n",
-            $row->{node},
+            $row->{node} // '-',
             $row->{clustered} && !$row->{no_cluster} ? 'YES' : 'NO',
             $row->{host} || $row->{name_host} || 'N/A',
             $row->{os} || 'N/A',
@@ -423,6 +435,60 @@ sub print_node_table {
             $row->{command} || 'N/A';
     }
 }
+
+sub print_cluster_timeline {
+    my @rows = @_;
+    my %node_hosts;
+    my @entries;
+    my %timeline_types = map { $_ => 1 } qw(
+        PEER_CONNECT PEER_DISCONNECT MASTER_CHANGE LOST_QUORUM ACHIEVED_QUORUM
+        SYNC_NEEDED SYNC_FAILURE REPOSITORY_MISMATCH FAILED_REDIRECT
+    );
+
+    for my $row (@rows) {
+        my $host = $row->{host} || $row->{name_host} || 'N/A';
+        $node_hosts{$row->{node}} //= $host if defined $row->{node};
+        push @entries, map { { row => $row, event => $_ } }
+            grep { $timeline_types{$_->{type}} } @{$row->{events}};
+    }
+    return unless @entries;
+
+    @entries = sort {
+           $a->{event}{timestamp} cmp $b->{event}{timestamp}
+        || $a->{event}{sequence} <=> $b->{event}{sequence}
+        || $a->{row}{file} cmp $b->{row}{file}
+    } @entries;
+
+    print "=== Cluster Timeline ===\n";
+    printf "%-19s %-4s %-20s %-24s %-7s\n", 'TIME', 'NODE', 'EVENT', 'MASTER', 'QUORUM';
+
+    my ($master_node, $quorum) = ('', '');
+    for my $entry (@entries) {
+        my $row = $entry->{row};
+        my $event = $entry->{event};
+        if ($event->{type} eq 'MASTER_CHANGE') {
+            my $node = node_from_text($event->{peer});
+            $master_node = $node if defined $node;
+        }
+        $quorum = 'ONLINE'  if $event->{type} eq 'ACHIEVED_QUORUM';
+        $quorum = 'OFFLINE' if $event->{type} eq 'LOST_QUORUM';
+
+        my $master = defined $master_node && length $master_node
+            ? 'N' . $master_node . ' (' . ($node_hosts{$master_node} || '?') . ')'
+            : '-';
+        printf "%-19s %-4s %-20s %-24s %-7s\n",
+            timeline_time($event->{timestamp}),
+            defined $row->{node} ? 'N' . $row->{node} : 'N?',
+            timeline_label($event->{type}),
+            $master,
+            $quorum || '-';
+    }
+    print "\n";
+}
+
+sub node_from_text { my($text)=@_;return undef unless defined$text;return$1 if$text=~/\bNode\s+(\d+)\b/i;return undef }
+sub timeline_time { my($timestamp)=@_;return'N/A'unless defined$timestamp;$timestamp=~s/T/ /;$timestamp=~s/,\d{3}$//;return$timestamp }
+sub timeline_label { my($type)=@_;my%labels=(PEER_CONNECT=>'JOIN CLUSTER',PEER_DISCONNECT=>'LEAVE CLUSTER',MASTER_CHANGE=>'MASTER CHANGE',LOST_QUORUM=>'QUORUM LOST',ACHIEVED_QUORUM=>'QUORUM ONLINE',SYNC_NEEDED=>'SYNC NEEDED',SYNC_FAILURE=>'SYNC FAILURE',REPOSITORY_MISMATCH=>'REPOSITORY MISMATCH',FAILED_REDIRECT=>'REDIRECT FAILED');return$labels{$type}||event_label($type) }
 
 sub print_progress {
     my ($completed, $total, $elapsed) = @_;

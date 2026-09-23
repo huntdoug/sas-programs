@@ -11,7 +11,7 @@ use Getopt::Long qw(GetOptions);
 use Time::Local qw(timegm);
 use Time::HiRes qw(time);
 
-our $VERSION = '2.2.31';
+our $VERSION = '2.2.32';
 
 my ($details, $verbose, $help, $show_version) = (1, 0, 0, 0);
 my $block_size = 1024 * 1024;
@@ -48,13 +48,21 @@ my @favorite_patterns = load_patterns($favorites_file);
 my @suppress_patterns = load_patterns($suppress_file);
 my $TIMESTAMP_RE = qr{^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2},\d{3})}m;
 my $started = time();
-my (%seen, @rows);
+my (%seen, @files, @rows);
 
 for my $file (grep { !$seen{$_}++ } @ARGV) {
     if (!-f $file) { warn "logdate: warning: not a regular file: $file\n"; next; }
-    push @rows, analyze_file($file);
+    push @files, $file;
 }
-usage(1, 'no readable log files supplied') unless @rows;
+usage(1, 'no readable log files supplied') unless @files;
+
+print_progress(0, scalar @files, 0) if @files > 1;
+for my $index (0 .. $#files) {
+    push @rows, analyze_file($files[$index]);
+    print_progress($index + 1, scalar @files, time() - $started) if @files > 1;
+}
+
+assign_node_numbers(@rows);
 
 @rows = sort {
        ($a->{begin} // '9999') cmp ($b->{begin} // '9999')
@@ -164,7 +172,7 @@ sub analyze_file {
         duration_ms=>undef, host=>'', norm_host=>'', name_host=>'', norm_name=>'',
         os=>'', release=>'', sas_version=>'', command=>'', trace=>0,
         trace_count=>0, debug_count=>0, info_count=>0, trace_ratio=>0,
-        startup=>0, running=>0, stopped=>0, lifecycle=>[], sample_redirect_count=>0,
+        startup=>0, running=>0, stopped=>0, clustered=>0, no_cluster=>0, node=>'', lifecycle=>[], sample_redirect_count=>0,
         redirects=>[], redirect_count=>0, redirect_hosts=>'', norm_redirects=>'',
         ranges=>[], events=>[], favorites=>[], suppressed=>{},
         role=>'UNKNOWN', status=>'OK',
@@ -185,14 +193,14 @@ sub analyze_file {
 
     if ($details) {
         apply_scan(\%r,scan_log($fh,$file,1));
-        $r{role}=$r{redirect_count}?'MASTER':'SLAVE';
+        $r{role}=cluster_role(\%r);
         $r{ranges}=build_ranges(\%r);
     } elsif (!$r{trace}) {
         apply_scan(\%r,scan_log($fh,$file,0));
-        $r{role}=$r{redirect_count}?'MASTER':'SLAVE';
+        $r{role}=cluster_role(\%r);
     } else {
         $r{redirect_count}=$r{sample_redirect_count};
-        $r{role}=$r{redirect_count}?'MASTER-LIKELY':'UNKNOWN';
+        $r{role}=cluster_role(\%r);
     }
     close($fh);
 
@@ -216,6 +224,8 @@ sub analyze_sample {
     $r->{debug_count}=()=$s=~/^\d{4}-.*?\bDEBUG\b/mg;
     $r->{info_count}=()=$s=~/^\d{4}-.*?\bINFO\b/mg;
     $r->{stopped}=1 if $s=~/\bState,\s*stopped\b/i;
+    $r->{clustered}=1 if $s=~/\bCluster\s+SASMeta\s*-\s*Logical Metadata Server\b/i;
+    $r->{no_cluster}=1 if $s=~/\bstartNoCluster\b/i;
     my$signal=$r->{trace_count}+$r->{debug_count};$r->{trace_ratio}=$signal/($r->{info_count}+1);
     $r->{trace}=($signal>0&&$signal>$r->{info_count})?1:0;
 }
@@ -284,6 +294,24 @@ sub apply_scan {
     $r->{running}=scalar(grep{$_->{type}eq'RUNNING'}@{$r->{lifecycle}})?1:0;
     my(%seen,@raw,@norm);for my$e(@{$r->{redirects}}){next if$seen{$e->{norm_target}}++;push@raw,$e->{target};push@norm,$e->{norm_target}}
     $r->{redirect_hosts}=join(', ',@raw)if@raw;$r->{norm_redirects}=join(', ',@norm)if@norm;
+}
+
+sub cluster_role { my($row)=@_;return'N'if$row->{no_cluster}||!$row->{clustered};return$row->{redirect_count}?'M':'S' }
+
+sub assign_node_numbers {
+    my @rows = @_;
+    my %hosts;
+    for my $row (@rows) {
+        my $host = $row->{norm_host} || $row->{norm_name} || $row->{file};
+        $hosts{$host} = 1;
+    }
+    my %nodes;
+    my $number = 1;
+    $nodes{$_} = $number++ for sort keys %hosts;
+    for my $row (@rows) {
+        my $host = $row->{norm_host} || $row->{norm_name} || $row->{file};
+        $row->{node} = $nodes{$host};
+    }
 }
 
 sub build_ranges {
@@ -358,11 +386,11 @@ sub print_cluster_findings {
 }
 
 sub print_header {
-    my($elapsed,@rows)=@_;my($bytes,$redirects,$events,$masters,$slaves,$trace)=(0,0,0,0,0,0);for my$r(@rows){$bytes+=$r->{size};$redirects+=$r->{redirect_count};$events+=scalar@{$r->{events}};$trace+=$r->{trace};$r->{role}eq'MASTER'?$masters++:$slaves++}my$mb=$bytes/1048576;
+    my($elapsed,@rows)=@_;my($bytes,$redirects,$events,$masters,$slaves,$standalone,$trace)=(0,0,0,0,0,0,0);for my$r(@rows){$bytes+=$r->{size};$redirects+=$r->{redirect_count};$events+=scalar@{$r->{events}};$trace+=$r->{trace};$r->{role}eq'M'?$masters++:$r->{role}eq'S'?$slaves++:$standalone++}my$mb=$bytes/1048576;
     print"logdate $VERSION\n";printf"Analyzed %d logs | %.1f MB | %d redirects | %d cluster events | %.2f sec\n\n",scalar(@rows),$mb,$redirects,$events,$elapsed;
     print"========================================================================\nSAS Metadata Server Cluster Timeline Analysis\n========================================================================\n";
     printf"Mode                : %s\n",$verbose?'Verbose':'Detailed';
-    printf"MASTER Nodes        : %d\nSLAVE Nodes         : %d\nTRACE Logs          : %d\n",$masters,$slaves,$trace;
+    printf"MASTER Nodes        : %d\nSLAVE Nodes         : %d\nSTANDALONE Nodes    : %d\nTRACE Logs          : %d\n",$masters,$slaves,$standalone,$trace;
     print"SAH Lifecycle       : ENABLED\nFirst Failure       : OUTCALL TIMEOUT PRIORITIZED\nLoad Balancing      : WRAPPER COMPACTED\n";
     printf"Elapsed Time        : %.2f sec\nMB / Second         : %.2f\n",$elapsed,$mb/$elapsed;
     print"========================================================================\n\n";
@@ -370,16 +398,24 @@ sub print_header {
 
 sub print_table {
     my@rows=@_;my$p='';my$prefix=$details?'':common_prefix(map{$_->{file}}@rows);
-    printf"%-10s %-8s %-18s %-15s %-5s %-7s %-7s %-8s %-13s %-7s %s\n",'DATE','BEGIN','END','DURATION','TRACE','START','RUN','STOPPED','ROLE','RDIR','FILE';
-    for my$r(@rows){my($bd,$bt)=split_timestamp($r->{begin});my($ed,$et)=split_timestamp($r->{end});my$d=($bd ne''&&$bd ne$p)?display_table_date($bd):'';$p=$bd if$bd ne'';my$end=$et||'N/A';$end="$ed T $et"if$ed ne''&&$bd ne''&&$ed ne$bd;my$file=$r->{file};$file=substr($file,length$prefix)if length$prefix;printf"%-10s %-8s %-18s %-15s %-5s %-7s %-7s %-8s %-13s %-7d %s",$d,table_time($bt),table_time($end),format_duration($r->{duration_ms}),$r->{trace}?'YES':'NO',$r->{startup}?'YES':'NO',$r->{running}?'YES':'NO',$r->{stopped}?'YES':'NO',$r->{role},$r->{redirect_count},$file;print" [$r->{status}]"if$r->{status}ne'OK';print"\n"}
+    printf"%-10s %-8s %-18s %-12s %-5s %-5s %-3s %-4s %-4s %-4s %s\n",'DATE','BEGIN','END','DURATION','TRACE','START','RUN','STOP','ROLE','RDIR','FILE';
+    for my$r(@rows){my($bd,$bt)=split_timestamp($r->{begin});my($ed,$et)=split_timestamp($r->{end});my$d=($bd ne''&&$bd ne$p)?display_table_date($bd):'';$p=$bd if$bd ne'';my$end=$et||'N/A';$end="$ed T $et"if$ed ne''&&$bd ne''&&$ed ne$bd;my$file=$r->{file};$file=substr($file,length$prefix)if length$prefix;printf"%-10s %-8s %-18s %-12s %-5s %-5s %-3s %-4s %-4s %-4d %s",$d,table_time($bt),table_time($end),format_duration($r->{duration_ms}),$r->{trace}?'YES':'NO',$r->{startup}?'YES':'NO',$r->{running}?'YES':'NO',$r->{stopped}?'YES':'NO',$r->{role},$r->{redirect_count},$file;print" [$r->{status}]"if$r->{status}ne'OK';print"\n"}
 }
 
 sub print_node_table {
     my @rows = @_;
     print "=== Server Information ===\n";
-    printf "%-20s %-12s %-34s %-20s %s\n", 'HOST', 'OS', 'KERN', 'SAS VERSION', 'COMMAND';
+    printf "%-4s %-7s %-20s %-12s %-34s %-20s %s\n", 'NODE', 'CLUSTER', 'HOST', 'OS', 'KERN', 'SAS VERSION', 'COMMAND';
+    my %hosts;
     for my $row (@rows) {
-        printf "%-20s %-12s %-34s %-20s %s\n",
+        my $host = $row->{norm_host} || $row->{norm_name} || $row->{file};
+        $hosts{$host} //= $row;
+    }
+    for my $host (sort keys %hosts) {
+        my $row = $hosts{$host};
+        printf "%-4s %-7s %-20s %-12s %-34s %-20s %s\n",
+            $row->{node},
+            $row->{clustered} && !$row->{no_cluster} ? 'YES' : 'NO',
             $row->{host} || $row->{name_host} || 'N/A',
             $row->{os} || 'N/A',
             $row->{release} || 'N/A',
@@ -387,6 +423,16 @@ sub print_node_table {
             $row->{command} || 'N/A';
     }
 }
+
+sub print_progress {
+    my ($completed, $total, $elapsed) = @_;
+    my $percent = int(($completed * 100) / $total);
+    my $eta = $completed ? format_eta(($elapsed / $completed) * ($total - $completed)) : 'calculating';
+    printf STDERR "\r%-60s", "Progress: $completed/$total ($percent%) ETA: $eta";
+    print STDERR "\n" if $completed == $total;
+}
+
+sub format_eta { my($seconds)=@_;$seconds=int($seconds+0.5);my$hours=int($seconds/3600);$seconds%=3600;my$minutes=int($seconds/60);$seconds%=60;return sprintf'%02d:%02d:%02d',$hours,$minutes,$seconds }
 
 sub table_time { my($value)=@_;return'N/A'unless defined$value&&length$value;$value=~s/,\d{3}\b//;return$value }
 sub display_table_date { my($date)=@_;return''unless defined$date;my$current_year=(localtime)[5]+1900;return$date=~s/^$current_year-//r }

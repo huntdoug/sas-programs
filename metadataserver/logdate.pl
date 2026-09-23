@@ -390,9 +390,14 @@ sub print_header {
 }
 
 sub print_table {
-    my@rows=@_;printf"%-10s %-12s %-23s %-15s %-5s %-7s %-7s %-8s %-13s %-7s %s\n",'DATE','BEGIN','END','DURATION','TRACE','START','RUN','STOPPED','ROLE','RDIR','FILE';my$p='';
-    for my$r(@rows){my($bd,$bt)=split_timestamp($r->{begin});my($ed,$et)=split_timestamp($r->{end});my$d=($bd ne''&&$bd ne$p)?$bd:'';$p=$bd if$bd ne'';my$end=$et||'N/A';$end="$ed T $et"if$ed ne''&&$bd ne''&&$ed ne$bd;printf"%-10s %-12s %-23s %-15s %-5s %-7s %-7s %-8s %-13s %-7d %s",$d,$bt||'N/A',$end,format_duration($r->{duration_ms}),$r->{trace}?'YES':'NO',$r->{startup}?'YES':'NO',$r->{running}?'YES':'NO',$r->{stopped}?'YES':'NO',$r->{role},$r->{redirect_count},$r->{file};print" [$r->{status}]"if$r->{status}ne'OK';print"\n"}
+    my@rows=@_;my$p='';my$prefix=$details?'':common_prefix(map{$_->{file}}@rows);
+    printf"%-10s %-8s %-18s %-15s %-5s %-7s %-7s %-8s %-13s %-7s %s\n",'DATE','BEGIN','END','DURATION','TRACE','START','RUN','STOPPED','ROLE','RDIR','FILE';
+    for my$r(@rows){my($bd,$bt)=split_timestamp($r->{begin});my($ed,$et)=split_timestamp($r->{end});my$d=($bd ne''&&$bd ne$p)?display_table_date($bd):'';$p=$bd if$bd ne'';my$end=$et||'N/A';$end="$ed T $et"if$ed ne''&&$bd ne''&&$ed ne$bd;my$file=$r->{file};$file=substr($file,length$prefix)if length$prefix;printf"%-10s %-8s %-18s %-15s %-5s %-7s %-7s %-8s %-13s %-7d %s",$d,table_time($bt),table_time($end),format_duration($r->{duration_ms}),$r->{trace}?'YES':'NO',$r->{startup}?'YES':'NO',$r->{running}?'YES':'NO',$r->{stopped}?'YES':'NO',$r->{role},$r->{redirect_count},$file;print" [$r->{status}]"if$r->{status}ne'OK';print"\n"}
 }
+
+sub table_time { my($value)=@_;return'N/A'unless defined$value&&length$value;$value=~s/,\d{3}\b//;return$value }
+sub display_table_date { my($date)=@_;return''unless defined$date;my$current_year=(localtime)[5]+1900;return$date=~s/^$current_year-//r }
+sub common_prefix { my@values=@_;return''unless@values>1;my$prefix=shift@values;for my$value(@values){my$length=length$prefix<length$value?length$prefix:length$value;my$index=0;$index++while$index<$length&&substr($prefix,$index,1)eq substr($value,$index,1);$prefix=substr($prefix,0,$index);last unless length$prefix}return$prefix }
 
 sub read_exact { my($fh,$n)=@_;my($b,$o)=('',0);while($o<$n){my$c=sysread($fh,$b,$n-$o,$o);last if!defined$c||$c==0;$o+=$c}return$b }
 sub find_begin { my($fh,$size)=@_;my($o,$c)=(0,'');while($o<$size){my$r=$size-$o;my$l=$r<$block_size?$r:$block_size;return undef unless defined sysseek($fh,$o,0);my$b=read_exact($fh,$l);last if$b eq'';my$d=$c.$b;return$1 if$d=~/$TIMESTAMP_RE/;$c=length($d)>128?substr($d,-128):$d;$o+=length$b}return undef }

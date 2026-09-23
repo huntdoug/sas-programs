@@ -13,7 +13,7 @@ use Time::HiRes qw(time);
 
 Getopt::Long::Configure('no_ignore_case');
 
-our $VERSION = '2.2.50';
+our $VERSION = '2.2.51';
 
 my ($details, $verbose, $help, $show_version) = (1, 0, 0, 0);
 my $block_size = 1024 * 1024;
@@ -51,17 +51,23 @@ my @suppress_patterns = load_patterns($suppress_file);
 my $TIMESTAMP_RE = qr{^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2},\d{3})}m;
 my $started = time();
 my (%seen, @files, @rows);
+my ($progress_total, $progress_completed, $progress_file, $progress_last_tick, $progress_ticks) = (0, 0, '', 0, 0);
 
 for my $file (grep { !$seen{$_}++ } @ARGV) {
     if (!-f $file) { warn "logdate: warning: not a regular file: $file\n"; next; }
     push @files, $file;
 }
 
-print_progress(0, scalar @files, 0, 'Starting') if @files > 1;
+print "logdate $VERSION\n";
+$progress_total = scalar @files;
+print_progress(0, $progress_total, 0, 0, 'Starting') if $progress_total > 1;
 for my $index (0 .. $#files) {
-    print_progress($index, scalar @files, time() - $started, "Processing " . progress_name($files[$index])) if @files > 1;
+    $progress_completed = $index;
+    $progress_file = $files[$index];
+    print_progress($index, $progress_total, time() - $started, 0, 'Scanning') if $progress_total > 1;
     push @rows, analyze_file($files[$index]);
-    print_progress($index + 1, scalar @files, time() - $started, 'Complete') if @files > 1;
+    $progress_completed = $index + 1;
+    print_progress($progress_completed, $progress_total, time() - $started, 0, 'Complete') if $progress_completed == $progress_total && $progress_total > 1;
 }
 
 assign_node_numbers(@rows);
@@ -75,7 +81,7 @@ $_->{role} = cluster_role($_) for @rows;
 
 my $elapsed = time() - $started;
 $elapsed = 0.000001 if $elapsed <= 0;
-$details ? print_header($elapsed, @rows) : print "logdate $VERSION\n\n";
+$details ? print_header($elapsed, @rows) : print "\n";
 print_node_table(@rows);
 print "\n";
 if ($details) {
@@ -260,6 +266,7 @@ sub scan_log {
     my($ts,$seq)=(undef,0);
     while(my$line=<$fh>){
         $ts=$1 if$line=~/$TIMESTAMP_RE/;
+        progress_scan_tick($fh, $file);
         next unless defined$ts;
 
         if($line=~/redirect(?:ing)?[^\n]{0,500}?\bat\s+([A-Za-z0-9._-]+)/i){
@@ -501,7 +508,7 @@ sub print_split_brain_evidence {
 
 sub print_header {
     my($elapsed,@rows)=@_;my($bytes,$redirects,$events,$masters,$slaves,$standalone,$trace)=(0,0,0,0,0,0,0);for my$r(@rows){$bytes+=$r->{size};$redirects+=$r->{redirect_count};$events+=scalar@{$r->{events}};$trace+=$r->{trace};$r->{role}eq'M'?$masters++:$r->{role}eq'S'?$slaves++:$standalone++}my$mb=$bytes/1048576;
-    print"logdate $VERSION\n";printf"Analyzed %d logs | %.1f MB | %d redirects | %d cluster events | %.2f sec\n\n",scalar(@rows),$mb,$redirects,$events,$elapsed;
+    printf"Analyzed %d logs | %.1f MB | %d redirects | %d cluster events | %.2f sec\n\n",scalar(@rows),$mb,$redirects,$events,$elapsed;
     print"========================================================================\nSAS Metadata Server Cluster Timeline Analysis\n========================================================================\n";
     printf"Mode                : %s\n",$verbose?'Verbose':'Detailed';
     printf"MASTER Nodes        : %d\nSLAVE Nodes         : %d\nSTANDALONE Nodes    : %d\nTRACE Logs          : %d\n",$masters,$slaves,$standalone,$trace;
@@ -872,15 +879,34 @@ sub timeline_label { my($type)=@_;my%labels=(PEER_CONNECT=>'JOIN CLUSTER',PEER_D
 sub visual_event { my($event)=@_;my$label=timeline_label($event->{type});if($event->{type}eq'MASTER_CHANGE'){my$node=node_from_text($event->{peer});$label=defined$node?"MASTER=N$node":$label}my$time=timeline_time($event->{timestamp});$time=~s/^\d{4}-\d{2}-\d{2}\s+//;return"$time $label" }
 
 sub print_progress {
-    my ($completed, $total, $elapsed, $activity) = @_;
-    my $percent = int(($completed * 100) / $total);
+    my ($completed, $total, $elapsed, $fraction, $activity) = @_;
+    my $overall = ($completed + $fraction) / $total;
+    $overall = 1 if $overall > 1;
+    my $percent = int($overall * 100);
     my $eta = $completed ? format_eta(($elapsed / $completed) * ($total - $completed)) : 'calculating';
-    $activity ||= $completed == $total ? 'Complete' : 'Processing';
-    printf STDERR "\r%-100s", "Progress: $completed/$total ($percent%) ETA: $eta | $activity";
+    my @spinner = ('*', '+', 'x', '+');
+    my $spin = $spinner[$progress_ticks++ % @spinner];
+    my $width = 16;
+    my $filled = int($overall * $width);
+    my $bar = '#' x $filled . '.' x ($width - $filled);
+    my $detail = $activity eq 'Complete' ? 'Complete' : "$activity " . progress_name($progress_file);
+    printf STDERR "\r%-78s", "$spin [$bar] $completed/$total $percent% ETA $eta $detail";
     print STDERR "\n" if $completed == $total;
 }
 
-sub progress_name { my($file)=@_;$file=~s{.*[\\/]}{};return$file }
+sub progress_scan_tick {
+    my ($fh, $file) = @_;
+    return unless $progress_total > 1;
+    my $now = time();
+    return if $now - $progress_last_tick < 0.5;
+    $progress_last_tick = $now;
+    my $size = -s $file || 1;
+    my $position = tell($fh);
+    my $fraction = defined $position && $position > 0 ? $position / $size : 0;
+    print_progress($progress_completed, $progress_total, $now - $started, $fraction, 'Scanning');
+}
+
+sub progress_name { my($file)=@_;$file=~s{.*[\\/]}{};$file=substr($file,0,28).'...' if length$file>31;return$file }
 
 sub format_eta { my($seconds)=@_;$seconds=int($seconds+0.5);my$hours=int($seconds/3600);$seconds%=3600;my$minutes=int($seconds/60);$seconds%=60;return sprintf'%02d:%02d:%02d',$hours,$minutes,$seconds }
 

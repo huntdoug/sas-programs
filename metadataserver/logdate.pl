@@ -11,7 +11,7 @@ use Getopt::Long qw(GetOptions);
 use Time::Local qw(timegm);
 use Time::HiRes qw(time);
 
-our $VERSION = '2.2.34';
+our $VERSION = '2.2.35';
 
 my ($details, $verbose, $help, $show_version) = (1, 0, 0, 0);
 my $block_size = 1024 * 1024;
@@ -249,7 +249,7 @@ sub scan_log {
 
         if($line=~/redirect(?:ing)?[^\n]{0,500}?\bat\s+([A-Za-z0-9._-]+)/i){
             my($target,$norm)=($1,normalize_host($1));
-            push@redirects,{timestamp=>$ts,target=>$target,norm_target=>$norm,sequence=>$seq++} if length$norm;
+            push@redirects,{timestamp=>$ts,target=>$target,norm_target=>$norm,sequence=>$seq++,raw=>clean_line($line)} if length$norm;
         }
 
         if($line=~/\bSAH011001I\b.*?\bState,\s*starting\b/i){
@@ -390,9 +390,34 @@ sub print_verbose_events {
 }
 
 sub print_cluster_findings {
-    my@rows=@_;print"=== Cluster Findings ===\n";my@masters;for my$r(@rows){my$source=$r->{norm_host}||$r->{norm_name}||$r->{file};push@masters,map{+{%$_,source=>$source}}@{$r->{ranges}}}
-    my$reported=0;OUTER:for my$i(0..$#masters-1){for my$j($i+1..$#masters){my($a,$b)=($masters[$i],$masters[$j]);next if$a->{source}eq$b->{source};my$s=$a->{start}gt$b->{start}?$a->{start}:$b->{start};my$e=$a->{end}lt$b->{end}?$a->{end}:$b->{end};next unless defined$s&&defined$e&&$s lt$e;print"WARNING: MASTER - SPLIT BRAIN POSSIBLE\n  Overlap: ".display_timestamp($s)." -> ".display_timestamp($e)."\n  MASTER: $a->{source}\n  MASTER: $b->{source}\n  ... additional split-brain overlaps suppressed\n\n";$reported=1;last OUTER}}
+    my@rows=@_;print"=== Cluster Findings ===\n";my@masters;for my$r(@rows){my$source=$r->{norm_host}||$r->{norm_name}||$r->{file};push@masters,map{+{%$_,source=>$source,row=>$r}}@{$r->{ranges}}}
+    my$reported=0;OUTER:for my$i(0..$#masters-1){for my$j($i+1..$#masters){my($a,$b)=($masters[$i],$masters[$j]);next if$a->{source}eq$b->{source};my$s=$a->{start}gt$b->{start}?$a->{start}:$b->{start};my$e=$a->{end}lt$b->{end}?$a->{end}:$b->{end};next unless defined$s&&defined$e&&$s lt$e;print"WARNING: MASTER - SPLIT BRAIN POSSIBLE\n  Overlap: ".display_timestamp($s)." -> ".display_timestamp($e)."\n  MASTER: $a->{source}\n  MASTER: $b->{source}\n";print_split_brain_evidence($a,$b,$s,$e);print"  ... additional split-brain overlaps suppressed\n\n";$reported=1;last OUTER}}
     print"No overlapping MASTER time ranges detected.\n\n"unless$reported;
+}
+
+sub print_split_brain_evidence {
+    my ($first, $second, $start, $end) = @_;
+    my @evidence;
+    for my $candidate ($first, $second) {
+        my $row = $candidate->{row};
+        my $source = $candidate->{source};
+        push @evidence, map {
+            { timestamp => $_->{timestamp}, sequence => $_->{sequence}, source => $source, text => $_->{raw} }
+        } grep { $_->{timestamp} ge $start && $_->{timestamp} le $end } @{$row->{events}};
+        push @evidence, map {
+            { timestamp => $_->{timestamp}, sequence => $_->{sequence}, source => $source, text => $_->{raw} || "Redirect to $_->{target}" }
+        } grep { $_->{timestamp} ge $start && $_->{timestamp} le $end } @{$row->{redirects}};
+    }
+    return unless @evidence;
+
+    print "  Relevant messages:\n";
+    for my $entry (sort {
+           $a->{timestamp} cmp $b->{timestamp}
+        || $a->{sequence} <=> $b->{sequence}
+        || $a->{source} cmp $b->{source}
+    } @evidence) {
+        printf "    %-23s %-18s %s\n", display_timestamp($entry->{timestamp}), $entry->{source}, $entry->{text};
+    }
 }
 
 sub print_header {

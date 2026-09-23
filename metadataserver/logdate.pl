@@ -13,7 +13,7 @@ use Time::HiRes qw(time);
 
 Getopt::Long::Configure('no_ignore_case');
 
-our $VERSION = '2.2.51';
+our $VERSION = '2.2.52';
 
 my ($details, $verbose, $help, $show_version) = (1, 0, 0, 0);
 my $block_size = 1024 * 1024;
@@ -507,14 +507,41 @@ sub print_split_brain_evidence {
 }
 
 sub print_header {
-    my($elapsed,@rows)=@_;my($bytes,$redirects,$events,$masters,$slaves,$standalone,$trace)=(0,0,0,0,0,0,0);for my$r(@rows){$bytes+=$r->{size};$redirects+=$r->{redirect_count};$events+=scalar@{$r->{events}};$trace+=$r->{trace};$r->{role}eq'M'?$masters++:$r->{role}eq'S'?$slaves++:$standalone++}my$mb=$bytes/1048576;
-    printf"Analyzed %d logs | %.1f MB | %d redirects | %d cluster events | %.2f sec\n\n",scalar(@rows),$mb,$redirects,$events,$elapsed;
-    print"========================================================================\nSAS Metadata Server Cluster Timeline Analysis\n========================================================================\n";
-    printf"Mode                : %s\n",$verbose?'Verbose':'Detailed';
-    printf"MASTER Nodes        : %d\nSLAVE Nodes         : %d\nSTANDALONE Nodes    : %d\nTRACE Logs          : %d\n",$masters,$slaves,$standalone,$trace;
-    print"SAH Lifecycle       : ENABLED\nFirst Failure       : OUTCALL TIMEOUT PRIORITIZED\nLoad Balancing      : WRAPPER COMPACTED\n";
-    printf"Elapsed Time        : %.2f sec\nMB / Second         : %.2f\n",$elapsed,$mb/$elapsed;
-    print"========================================================================\n\n";
+    my ($elapsed, @rows) = @_;
+    my %events;
+    my ($bytes, $redirects, $trace) = (0, 0, 0);
+    for my $row (@rows) {
+        $bytes += $row->{size};
+        $redirects += $row->{redirect_count};
+        $trace += $row->{trace};
+        $events{$_->{type}}++ for @{$row->{events}};
+    }
+    my $summaries = host_summaries(@rows);
+    my (@masters, @slaves, @standalone);
+    for my $summary (values %$summaries) {
+        my $role = host_role($summary, @rows);
+        my $label = node_label($summary->{node}) . ' ' . ($summary->{row}{host} || $summary->{row}{name_host} || 'N/A');
+        $role eq 'M' ? push(@masters, $label) : $role eq 'S' ? push(@slaves, $label) : push(@standalone, $label);
+    }
+    my $mb = $bytes / 1048576;
+    my $period_start = @rows ? timeline_time($rows[0]{begin}) : 'N/A';
+    my $period_end = @rows ? timeline_time($rows[-1]{end}) : 'N/A';
+    my $starts = scalar grep { $_->{startup} } @rows;
+    my $runs = scalar grep { $_->{running} } @rows;
+    my $stops = scalar grep { $_->{stopped} } @rows;
+
+    print "========================================================================\nAnalysis Summary\n========================================================================\n";
+    printf "Files: %d | Hosts: %d | %.1f MB | %.2f sec | %.2f MB/sec\n", scalar(@rows), scalar(keys %$summaries), $mb, $elapsed, $mb / $elapsed;
+    print "Period: $period_start -> $period_end\n\n";
+    print "Topology: " . (@masters || @slaves ? 'Cluster' : 'Standalone') . "\n";
+    print "Master: " . (@masters ? join(', ', sort @masters) : 'Not resolved') . "\n";
+    print "Slaves: " . (@slaves ? join(', ', sort @slaves) : '-') . "\n";
+    print "Standalone: " . (@standalone ? join(', ', sort @standalone) : '-') . "\n\n";
+    printf "Lifecycle: starts=%d | runs=%d | stopped=%d | TRACE-enabled=%d/%d\n", $starts, $runs, $stops, $trace, scalar(@rows);
+    printf "Cluster: joins=%d | leaves=%d | quorum online=%d | quorum lost=%d\n", $events{PEER_CONNECT} || 0, $events{PEER_DISCONNECT} || 0, $events{ACHIEVED_QUORUM} || 0, $events{LOST_QUORUM} || 0;
+    printf "Routing: %d client redirects (routing activity, not master elections)\n", $redirects;
+    printf "Incidents: outcall timeouts=%d | load-balancer failures=%d | sync events=%d\n", $events{OUTCALL_TIMEOUT} || 0, $events{LOAD_BALANCER_WRAPPER} || 0, ($events{SYNC_NEEDED} || 0) + ($events{SYNC_FAILURE} || 0);
+    print "========================================================================\n\n";
 }
 
 sub print_table {

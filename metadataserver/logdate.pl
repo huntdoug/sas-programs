@@ -13,7 +13,7 @@ use Time::HiRes qw(time);
 
 Getopt::Long::Configure('no_ignore_case');
 
-our $VERSION = '2.2.46';
+our $VERSION = '2.2.49';
 
 my ($details, $verbose, $help, $show_version) = (1, 0, 0, 0);
 my $block_size = 1024 * 1024;
@@ -57,10 +57,11 @@ for my $file (grep { !$seen{$_}++ } @ARGV) {
     push @files, $file;
 }
 
-print_progress(0, scalar @files, 0) if @files > 1;
+print_progress(0, scalar @files, 0, 'Starting') if @files > 1;
 for my $index (0 .. $#files) {
+    print_progress($index, scalar @files, time() - $started, "Processing " . progress_name($files[$index])) if @files > 1;
     push @rows, analyze_file($files[$index]);
-    print_progress($index + 1, scalar @files, time() - $started) if @files > 1;
+    print_progress($index + 1, scalar @files, time() - $started, 'Complete') if @files > 1;
 }
 
 assign_node_numbers(@rows);
@@ -77,8 +78,10 @@ $elapsed = 0.000001 if $elapsed <= 0;
 $details ? print_header($elapsed, @rows) : print "logdate $VERSION\n\n";
 print_node_table(@rows);
 print "\n";
-print_marker_summary(@rows);
-print "\n";
+if ($details) {
+    print_marker_summary(@rows);
+    print "\n";
+}
 print_table(@rows);
 print "\n";
 print_cluster_state_report(@rows) if $details;
@@ -175,10 +178,10 @@ sub analyze_file {
     my ($file) = @_;
     my %r = (
         file=>$file, size=>(-s $file || 0), begin=>undef, end=>undef,
-        duration_ms=>undef, host=>'', ip=>'', peer_ips=>[], norm_host=>'', name_host=>'', norm_name=>'',
+        duration_ms=>undef, host=>'', ip=>'', ipv6_loopback=>0, ipv6_listen=>0, peer_ips=>[], norm_host=>'', name_host=>'', norm_name=>'',
         os=>'', release=>'', sas_version=>'', command=>'', trace=>0,
         trace_count=>0, debug_count=>0, info_count=>0, trace_ratio=>0,
-        startup=>0, running=>0, stopped=>0, clustered=>0, not_master=>0, backup_completed=>0, normal=>0, no_cluster=>0,
+        startup=>0, running=>0, stopped=>0, clustered=>0, not_master=>0, backup_completed=>0, normal=>0, no_cluster=>0, recover=>0,
         node=>'', node_number=>undef, master_node=>undef,
         lifecycle=>[], sample_redirect_count=>0,
         redirects=>[], redirect_count=>0, redirect_hosts=>'', norm_redirects=>'',
@@ -226,7 +229,9 @@ sub analyze_sample {
     if($s=~/Host:\s*'([^']+)'\s*,\s*OS:\s*'([^']*)'\s*,\s*Release:\s*'([^']*)'\s*,\s*SAS Version:\s*'([^']*)'\s*,\s*Command:\s*'([^']*)'/is){
         ($r->{host},$r->{os},$r->{release},$r->{sas_version},$r->{command})=($1,$2,$3,$4,$5);$r->{norm_host}=normalize_host($1)
     }elsif($s=~/Host:\s*'([^']+)'/i){$r->{host}=$1;$r->{norm_host}=normalize_host($1)}
-        $r->{ip}=$1 if $s=~/Server is executing on host\s+[^\s]+\s+\(([0-9.]+)\)/i;
+    $r->{ip}=$1 if $s=~/Server is executing on host\s+[^\s]+\s+\(([0-9.]+)\)/i;
+    $r->{ipv6_loopback}=1 if $s=~/Also known as:[\s\S]{0,500}?^\d{4}-.*?\s+::1\s*$/m;
+    $r->{ipv6_listen}=1 if $s=~/Reserved IPv6 port 8561 for server listen/i;
     if($file=~/SASMeta_MetadataServer_[0-9T-]+_([A-Z0-9]+)_/i){$r->{name_host}=$1;$r->{norm_name}=normalize_host($1)}
     my $local_host = $r->{norm_host} || $r->{norm_name};
     my @sample_redirects = ($s =~ /redirect(?:ing)?[^\n]{0,500}?\bat\s+([A-Za-z0-9._-]+)/ig);
@@ -242,6 +247,7 @@ sub analyze_sample {
     $r->{not_master}=1 if $s=~/scheduled backup was not run.*not the master node/i;
     $r->{backup_completed}=1 if $s=~/The Backup has completed successfully/i;
     $r->{no_cluster}=1 if $s=~/\bstartNoCluster\b/i;
+    $r->{recover}=1 if $r->{command}=~/\B-recover\b/i || $s=~/\B-recover\b/i;
     my$signal=$r->{trace_count}+$r->{debug_count};$r->{trace_ratio}=$signal/($r->{info_count}+1);
     $r->{trace}=($signal>0&&$signal>$r->{info_count})?1:0;
 }
@@ -512,23 +518,45 @@ sub print_table {
 
 sub print_node_table {
     my @rows = @_;
+    my $summaries = host_summaries(@rows);
+    my %ip_hosts;
+    $ip_hosts{$_->{ip}} //= ($_->{host} || $_->{name_host} || 'N/A') for grep { $_->{ip} } @rows;
+
     print "=== Server Information ===\n";
-    printf "%-4s %-9s %-7s %-20s %-15s %-12s %-34s %-20s %s\n", 'NODE', 'SOURCE', 'CLUSTER', 'HOST', 'IP', 'OS', 'KERN', 'SAS VERSION', 'COMMAND';
+    printf "%-4s %-4s %-8s %-20s %-15s %-4s %-14s %-34s %s\n", 'NODE', 'ROLE', 'MODE', 'HOST', 'IPV4', 'OS', 'SAS', 'KERNEL', 'COMMAND';
     for my $summary (sort {
            node_sort_key($a->{node_conflict} ? 'conflict' : $a->{node} // 'unknown') <=> node_sort_key($b->{node_conflict} ? 'conflict' : $b->{node} // 'unknown')
         || host_key($a->{row}) cmp host_key($b->{row})
-    } values %{host_summaries(@rows)}) {
+    } values %$summaries) {
         my $row = $summary->{row};
-        printf "%-4s %-9s %-7s %-20s %-15s %-12s %-34s %-20s %s\n",
-            $summary->{node_conflict} ? '?' : $summary->{node} // '-',
-            $summary->{node_source} || '-',
-            $summary->{clustered} ? 'YES' : 'NO',
+        printf "%-4s %-4s %-8s %-20s %-15s %-4s %-14s %-34s %s\n",
+            node_label($summary->{node_conflict} ? undef : $summary->{node}),
+            host_role($summary, @rows),
+            host_mode($summary, @rows),
             $row->{host} || $row->{name_host} || 'N/A',
-            $row->{ip} || 'N/A',
-            $row->{os} || 'N/A',
+            host_value($summary, \@rows, 'ip') || 'N/A',
+            short_os($row->{os}),
+            short_sas($row->{sas_version}),
             $row->{release} || 'N/A',
-            $row->{sas_version} || 'N/A',
-            $row->{command} || 'N/A';
+            short_command($row->{command});
+    }
+
+    print "\n=== Server Network ===\n";
+    printf "%-4s %-20s %-8s %-8s %-22s %s\n", 'NODE', 'HOST', 'IPV6', 'LISTEN', 'METADATA PEERS', 'FLAGS';
+    for my $summary (sort {
+           node_sort_key($a->{node_conflict} ? 'conflict' : $a->{node} // 'unknown') <=> node_sort_key($b->{node_conflict} ? 'conflict' : $b->{node} // 'unknown')
+        || host_key($a->{row}) cmp host_key($b->{row})
+    } values %$summaries) {
+        my @host_rows = grep { host_key($_) eq host_key($summary->{row}) } @rows;
+        my %peers;
+        $peers{$ip_hosts{$_} || $_} = 1 for map { @{$_->{peer_ips}} } @host_rows;
+        printf "%-4s %-20s %-8s %-8s %-22s %s\n",
+            node_label($summary->{node_conflict} ? undef : $summary->{node}),
+            $summary->{row}{host} || $summary->{row}{name_host} || 'N/A',
+            (grep { $_->{ipv6_loopback} } @host_rows) ? '::1' : '-',
+            (grep { $_->{ipv6_listen} } @host_rows) ? 'IPv6' : '-',
+            join(', ', sort keys %peers) || '-',
+            join(', ', host_flags($summary, @host_rows)) || '-';
     }
 }
 
@@ -815,6 +843,42 @@ sub print_cluster_visual {
 
 sub node_from_text { my($text)=@_;return undef unless defined$text;return$1 if$text=~/\bNode\s+(\d+)\b/i;return undef }
 sub node_label { my($node)=@_;return defined $node ? "N$node" : 'N?' }
+sub host_value {
+    my ($summary, $rows, $field) = @_;
+    for my $row (grep { host_key($_) eq host_key($summary->{row}) } @$rows) {
+        return $row->{$field} if defined $row->{$field} && length $row->{$field};
+    }
+    return '';
+}
+sub host_role {
+    my ($summary, @rows) = @_;
+    my @host_rows = grep { host_key($_) eq host_key($summary->{row}) } @rows;
+    return 'M' if grep { $_->{role} eq 'M' } @host_rows;
+    return 'S' if grep { $_->{role} eq 'S' } @host_rows;
+    return 'N';
+}
+sub host_mode {
+    my ($summary, @rows) = @_;
+    my @host_rows = grep { host_key($_) eq host_key($summary->{row}) } @rows;
+    return 'SINGLE' if grep { $_->{no_cluster} } @host_rows;
+    return 'RECOVER' if grep { $_->{recover} } @host_rows;
+    return $summary->{clustered} ? 'CLUSTER' : 'NORMAL';
+}
+sub host_flags {
+    my ($summary, @host_rows) = @_;
+    my @flags;
+    push @flags, 'RECOVER' if grep { $_->{recover} } @host_rows;
+    push @flags, 'SINGLE' if grep { $_->{no_cluster} } @host_rows;
+    my %lifecycle;
+    $lifecycle{$_->{type}} = 1 for map { @{$_->{lifecycle}} } @host_rows;
+    push @flags, 'SAH:START' if $lifecycle{STARTING};
+    push @flags, 'SAH:RUN' if $lifecycle{RUNNING};
+    push @flags, 'SAH:STOP' if grep { $_->{stopped} } @host_rows;
+    return @flags;
+}
+sub short_os { my($value)=@_;return'N/A'unless defined$value&&length$value;$value=~s/\s.*$//;return$value }
+sub short_sas { my($value)=@_;return'N/A'unless defined$value&&length$value;$value=~s/^9\.04\.01M/94M/;return$value }
+sub short_command { my($value)=@_;return'N/A'unless defined$value&&length$value;$value=~s/^['"]|['"]$//g;return$1 if$value=~m{\b(sasexe/sas\b.*)$};return$value }
 sub master_for_event { my($row,$event)=@_;return node_from_text($event->{peer}) // $row->{master_node} // $row->{node} }
 sub short_timestamp { my($timestamp)=@_;return'N/A'unless defined$timestamp;$timestamp=~s/^\d{4}-//;$timestamp=~s/T/ /;$timestamp=~s/,\d{3}$//;return$timestamp }
 sub graph_time { my($timestamp)=@_;return'N/A'unless defined$timestamp;$timestamp=~s/^\d{2}-\d{2}\s+//;return$timestamp }
@@ -824,12 +888,15 @@ sub timeline_label { my($type)=@_;my%labels=(PEER_CONNECT=>'JOIN CLUSTER',PEER_D
 sub visual_event { my($event)=@_;my$label=timeline_label($event->{type});if($event->{type}eq'MASTER_CHANGE'){my$node=node_from_text($event->{peer});$label=defined$node?"MASTER=N$node":$label}my$time=timeline_time($event->{timestamp});$time=~s/^\d{4}-\d{2}-\d{2}\s+//;return"$time $label" }
 
 sub print_progress {
-    my ($completed, $total, $elapsed) = @_;
+    my ($completed, $total, $elapsed, $activity) = @_;
     my $percent = int(($completed * 100) / $total);
     my $eta = $completed ? format_eta(($elapsed / $completed) * ($total - $completed)) : 'calculating';
-    printf STDERR "\r%-60s", "Progress: $completed/$total ($percent%) ETA: $eta";
+    $activity ||= $completed == $total ? 'Complete' : 'Processing';
+    printf STDERR "\r%-100s", "Progress: $completed/$total ($percent%) ETA: $eta | $activity";
     print STDERR "\n" if $completed == $total;
 }
+
+sub progress_name { my($file)=@_;$file=~s{.*[\\/]}{};return$file }
 
 sub format_eta { my($seconds)=@_;$seconds=int($seconds+0.5);my$hours=int($seconds/3600);$seconds%=3600;my$minutes=int($seconds/60);$seconds%=60;return sprintf'%02d:%02d:%02d',$hours,$minutes,$seconds }
 

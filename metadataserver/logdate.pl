@@ -11,7 +11,7 @@ use Getopt::Long qw(GetOptions);
 use Time::Local qw(timegm);
 use Time::HiRes qw(time);
 
-our $VERSION = '2.2.28';
+our $VERSION = '2.2.29';
 
 my ($details, $verbose, $help, $show_version) = (1, 0, 0, 0);
 my $block_size = 1024 * 1024;
@@ -397,7 +397,7 @@ sub print_table {
 
 sub table_time { my($value)=@_;return'N/A'unless defined$value&&length$value;$value=~s/,\d{3}\b//;return$value }
 sub display_table_date { my($date)=@_;return''unless defined$date;my$current_year=(localtime)[5]+1900;return$date=~s/^$current_year-//r }
-sub common_prefix { my@values=@_;return''unless@values>1;my$prefix=shift@values;for my$value(@values){my$length=length$prefix<length$value?length$prefix:length$value;my$index=0;$index++while$index<$length&&substr($prefix,$index,1)eq substr($value,$index,1);$prefix=substr($prefix,0,$index);last unless length$prefix}return$prefix }
+sub common_prefix { my@values=@_;return''unless@values;my$prefix=shift@values;for my$value(@values){my$length=length$prefix<length$value?length$prefix:length$value;my$index=0;$index++while$index<$length&&substr($prefix,$index,1)eq substr($value,$index,1);$prefix=substr($prefix,0,$index);last unless length$prefix}return$prefix }
 
 sub read_exact { my($fh,$n)=@_;my($b,$o)=('',0);while($o<$n){my$c=sysread($fh,$b,$n-$o,$o);last if!defined$c||$c==0;$o+=$c}return$b }
 sub find_begin { my($fh,$size)=@_;my($o,$c)=(0,'');while($o<$size){my$r=$size-$o;my$l=$r<$block_size?$r:$block_size;return undef unless defined sysseek($fh,$o,0);my$b=read_exact($fh,$l);last if$b eq'';my$d=$c.$b;return$1 if$d=~/$TIMESTAMP_RE/;$c=length($d)>128?substr($d,-128):$d;$o+=length$b}return undef }

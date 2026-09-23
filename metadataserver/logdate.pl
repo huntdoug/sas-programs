@@ -11,7 +11,7 @@ use Getopt::Long qw(GetOptions);
 use Time::Local qw(timegm);
 use Time::HiRes qw(time);
 
-our $VERSION = '2.2.38';
+our $VERSION = '2.2.39';
 
 my ($details, $verbose, $help, $show_version) = (1, 0, 0, 0);
 my $block_size = 1024 * 1024;
@@ -74,9 +74,9 @@ $_->{role} = cluster_role($_) for @rows;
 my $elapsed = time() - $started;
 $elapsed = 0.000001 if $elapsed <= 0;
 $details ? print_header($elapsed, @rows) : print "logdate $VERSION\n\n";
-print_table(@rows);
-print "\n";
 print_node_table(@rows);
+print "\n";
+print_table(@rows);
 print "\n";
 print_cluster_visual(@rows) if $details;
 print_cluster_timeline(@rows) if $details;
@@ -345,12 +345,14 @@ sub host_summaries {
         $summary->{node_conflict} = @nodes > 1 ? 1 : 0;
     }
     my @cluster_hosts = grep { $summaries{$_}{clustered} && !$summaries{$_}{node_conflict} } keys %summaries;
-    my @unmapped = grep { !defined $summaries{$_}{node} } @cluster_hosts;
+    my @unmapped = sort grep { !defined $summaries{$_}{node} } @cluster_hosts;
     my %used_nodes = map { ($summaries{$_}{node} => 1) } grep { defined $summaries{$_}{node} } @cluster_hosts;
     my @available = grep { !$used_nodes{$_} } 1 .. 3;
-    if (@cluster_hosts == 3 && @unmapped == 1 && @available == 1) {
-        $summaries{$unmapped[0]}{node} = $available[0];
-        $summaries{$unmapped[0]}{node_source} = 'INFERRED';
+    if (@cluster_hosts == 3 && @unmapped == @available) {
+        for my $index (0 .. $#unmapped) {
+            $summaries{$unmapped[$index]}{node} = $available[$index];
+            $summaries{$unmapped[$index]}{node_source} = 'INFERRED';
+        }
     }
     return \%summaries;
 }

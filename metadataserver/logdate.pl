@@ -11,7 +11,7 @@ use Getopt::Long qw(GetOptions);
 use Time::Local qw(timegm);
 use Time::HiRes qw(time);
 
-our $VERSION = '2.2.35';
+our $VERSION = '2.2.38';
 
 my ($details, $verbose, $help, $show_version) = (1, 0, 0, 0);
 my $block_size = 1024 * 1024;
@@ -63,6 +63,7 @@ for my $index (0 .. $#files) {
 }
 
 assign_node_numbers(@rows);
+$_->{role} = cluster_role($_) for @rows;
 
 @rows = sort {
        ($a->{begin} // '9999') cmp ($b->{begin} // '9999')
@@ -77,6 +78,7 @@ print_table(@rows);
 print "\n";
 print_node_table(@rows);
 print "\n";
+print_cluster_visual(@rows) if $details;
 print_cluster_timeline(@rows) if $details;
 
 print_cluster_findings(@rows) if $details;
@@ -230,7 +232,6 @@ sub analyze_sample {
     $r->{clustered}=1 if $s=~/\bCluster\s+SASMeta\s*-\s*Logical Metadata Server\b/i ||
                           $s=~/\bConnecting server\b.*?\bto cluster\b/i ||
                           $s=~/\bThe cluster has (?:achieved|lost) quorum\b/i;
-    $r->{node_number}=$1 if $s=~/\bConnecting server\b.*?\bNode\s+(\d+)\s+to\s+cluster\b/i;
     $r->{master_node}=$1 if $s=~/\bSetting the master node to\b.*?\bNode\s+(\d+)\b/i;
     $r->{no_cluster}=1 if $s=~/\bstartNoCluster\b/i;
     my$signal=$r->{trace_count}+$r->{debug_count};$r->{trace_ratio}=$signal/($r->{info_count}+1);
@@ -249,7 +250,8 @@ sub scan_log {
 
         if($line=~/redirect(?:ing)?[^\n]{0,500}?\bat\s+([A-Za-z0-9._-]+)/i){
             my($target,$norm)=($1,normalize_host($1));
-            push@redirects,{timestamp=>$ts,target=>$target,norm_target=>$norm,sequence=>$seq++,raw=>clean_line($line)} if length$norm;
+            my($node_number)=$line=~/\bNode\s+(\d+)\b[^\n]{0,200}?\bat\s+[A-Za-z0-9._-]+/i;
+            push@redirects,{timestamp=>$ts,target=>$target,norm_target=>$norm,node_number=>$node_number,sequence=>$seq++,raw=>clean_line($line)} if length$norm;
         }
 
         if($line=~/\bSAH011001I\b.*?\bState,\s*starting\b/i){
@@ -258,7 +260,6 @@ sub scan_log {
         if($line=~/\bSAH011999I\b.*?\bState,\s*running\b/i){
             push@lifecycle,{timestamp=>$ts,type=>'RUNNING',code=>'SAH011999I',sequence=>$seq++};
         }
-        $node_number=$1 if $line=~/\bConnecting server\b.*?\bNode\s+(\d+)\s+to\s+cluster\b/i;
         $master_node=$1 if $line=~/\bSetting the master node to\b.*?\bNode\s+(\d+)\b/i;
 
         next unless$collect;
@@ -300,9 +301,8 @@ sub apply_scan {
     $r->{redirects}=$scan->{redirects};$r->{redirect_count}=scalar@{$scan->{redirects}};
     $r->{events}=$scan->{events};$r->{favorites}=$scan->{favorites};
     $r->{lifecycle}=$scan->{lifecycle};$r->{suppressed}=$scan->{suppressed};
-    $r->{node_number}=$scan->{node_number} if defined $scan->{node_number};
     $r->{master_node}=$scan->{master_node} if defined $scan->{master_node};
-    $r->{clustered}=1 if defined $r->{node_number} || defined $r->{master_node};
+    $r->{clustered}=1 if defined $r->{master_node};
     $r->{startup}=scalar(grep{$_->{type}eq'STARTING'}@{$r->{lifecycle}})?1:0;
     $r->{running}=scalar(grep{$_->{type}eq'RUNNING'}@{$r->{lifecycle}})?1:0;
     my(%seen,@raw,@norm);for my$e(@{$r->{redirects}}){next if$seen{$e->{norm_target}}++;push@raw,$e->{target};push@norm,$e->{norm_target}}
@@ -313,16 +313,49 @@ sub cluster_role { my($row)=@_;return'N'if$row->{no_cluster}||!$row->{clustered}
 
 sub assign_node_numbers {
     my @rows = @_;
-    my %hosts;
+    my $summaries = host_summaries(@rows);
     for my $row (@rows) {
-        my $host = $row->{norm_host} || $row->{norm_name} || $row->{file};
-        $hosts{$host} //= $row;
-    }
-    for my $row (@rows) {
-        my $host = $row->{norm_host} || $row->{norm_name} || $row->{file};
-        $row->{node} = $hosts{$host}{node_number};
+        my $host = host_key($row);
+        $row->{node} = $summaries->{$host}{node};
     }
 }
+
+sub host_summaries {
+    my @rows = @_;
+    my %summaries;
+    for my $row (@rows) {
+        my $host = host_key($row);
+        my $summary = $summaries{$host} //= {
+            row => $row, logs => 0, clustered => 0, node_numbers => {}, node_source => '',
+        };
+        $summary->{logs}++;
+        $summary->{clustered} ||= $row->{clustered};
+        $summary->{row} = $row if !$summary->{row}{host} && $row->{host};
+    }
+    for my $row (@rows) {
+        for my $redirect (@{$row->{redirects}}) {
+            next unless defined $redirect->{node_number} && exists $summaries{$redirect->{norm_target}};
+            $summaries{$redirect->{norm_target}}{node_numbers}{$redirect->{node_number}} = 1;
+            $summaries{$redirect->{norm_target}}{node_source} = 'REDIRECT';
+        }
+    }
+    for my $summary (values %summaries) {
+        my @nodes = sort { $a <=> $b } keys %{$summary->{node_numbers}};
+        $summary->{node} = $nodes[0] if @nodes == 1;
+        $summary->{node_conflict} = @nodes > 1 ? 1 : 0;
+    }
+    my @cluster_hosts = grep { $summaries{$_}{clustered} && !$summaries{$_}{node_conflict} } keys %summaries;
+    my @unmapped = grep { !defined $summaries{$_}{node} } @cluster_hosts;
+    my %used_nodes = map { ($summaries{$_}{node} => 1) } grep { defined $summaries{$_}{node} } @cluster_hosts;
+    my @available = grep { !$used_nodes{$_} } 1 .. 3;
+    if (@cluster_hosts == 3 && @unmapped == 1 && @available == 1) {
+        $summaries{$unmapped[0]}{node} = $available[0];
+        $summaries{$unmapped[0]}{node_source} = 'INFERRED';
+    }
+    return \%summaries;
+}
+
+sub host_key { my($row)=@_;return$row->{norm_host}||$row->{norm_name}||$row->{file} }
 
 sub build_ranges {
     my($r)=@_;my@e=sort{$a->{timestamp}cmp$b->{timestamp}||$a->{sequence}<=>$b->{sequence}}@{$r->{redirects}};return[]unless@e;
@@ -440,19 +473,16 @@ sub print_table {
 sub print_node_table {
     my @rows = @_;
     print "=== Server Information ===\n";
-    printf "%-4s %-7s %-20s %-12s %-34s %-20s %s\n", 'NODE', 'CLUSTER', 'HOST', 'OS', 'KERN', 'SAS VERSION', 'COMMAND';
-    my %hosts;
-    for my $row (@rows) {
-        my $host = $row->{norm_host} || $row->{norm_name} || $row->{file};
-        $hosts{$host} //= $row;
-    }
-    my %nodes;
-    $nodes{defined $_->{node} ? $_->{node} : 'unknown'} //= $_ for values %hosts;
-    for my $node (sort { $a eq 'unknown' ? 1 : $b eq 'unknown' ? -1 : $a <=> $b } keys %nodes) {
-        my $row = $nodes{$node};
-        printf "%-4s %-7s %-20s %-12s %-34s %-20s %s\n",
-            $row->{node} // '-',
-            $row->{clustered} && !$row->{no_cluster} ? 'YES' : 'NO',
+    printf "%-4s %-9s %-7s %-20s %-12s %-34s %-20s %s\n", 'NODE', 'SOURCE', 'CLUSTER', 'HOST', 'OS', 'KERN', 'SAS VERSION', 'COMMAND';
+    for my $summary (sort {
+           node_sort_key($a->{node_conflict} ? 'conflict' : $a->{node} // 'unknown') <=> node_sort_key($b->{node_conflict} ? 'conflict' : $b->{node} // 'unknown')
+        || host_key($a->{row}) cmp host_key($b->{row})
+    } values %{host_summaries(@rows)}) {
+        my $row = $summary->{row};
+        printf "%-4s %-9s %-7s %-20s %-12s %-34s %-20s %s\n",
+            $summary->{node_conflict} ? '?' : $summary->{node} // '-',
+            $summary->{node_source} || '-',
+            $summary->{clustered} ? 'YES' : 'NO',
             $row->{host} || $row->{name_host} || 'N/A',
             $row->{os} || 'N/A',
             $row->{release} || 'N/A',
@@ -511,9 +541,43 @@ sub print_cluster_timeline {
     print "\n";
 }
 
+sub print_cluster_visual {
+    my @rows = @_;
+    my %lanes;
+    my %hosts;
+    my %timeline_types = map { $_ => 1 } qw(
+        PEER_CONNECT PEER_DISCONNECT MASTER_CHANGE LOST_QUORUM ACHIEVED_QUORUM
+        SYNC_NEEDED SYNC_FAILURE REPOSITORY_MISMATCH FAILED_REDIRECT
+    );
+
+    for my $row (@rows) {
+        my $node = defined $row->{node} ? $row->{node} : 'unknown';
+        $hosts{$node} //= $row->{host} || $row->{name_host} || 'N/A';
+        push @{$lanes{$node}}, grep { $timeline_types{$_->{type}} } @{$row->{events}};
+    }
+    return unless keys %lanes;
+
+    print "=== Cluster Visual ===\n";
+    for my $node (sort { $a eq 'unknown' ? 1 : $b eq 'unknown' ? -1 : $a <=> $b } keys %lanes) {
+        my @events = sort {
+               $a->{timestamp} cmp $b->{timestamp}
+            || $a->{sequence} <=> $b->{sequence}
+        } @{$lanes{$node}};
+        next unless @events;
+        my $omitted = @events > 8 ? @events - 8 : 0;
+        @events = @events[0 .. 7] if $omitted;
+        my @steps = map { visual_event($_) } @events;
+        push @steps, "+$omitted events" if $omitted;
+        printf "N%-3s %-20s %s\n", $node eq 'unknown' ? '?' : $node, $hosts{$node}, join(' -> ', @steps);
+    }
+    print "\n";
+}
+
 sub node_from_text { my($text)=@_;return undef unless defined$text;return$1 if$text=~/\bNode\s+(\d+)\b/i;return undef }
+sub node_sort_key { my($node)=@_;return$node if$node=~/^\d+$/;return 9998 if$node eq'conflict';return 9999 }
 sub timeline_time { my($timestamp)=@_;return'N/A'unless defined$timestamp;$timestamp=~s/T/ /;$timestamp=~s/,\d{3}$//;return$timestamp }
 sub timeline_label { my($type)=@_;my%labels=(PEER_CONNECT=>'JOIN CLUSTER',PEER_DISCONNECT=>'LEAVE CLUSTER',MASTER_CHANGE=>'MASTER CHANGE',LOST_QUORUM=>'QUORUM LOST',ACHIEVED_QUORUM=>'QUORUM ONLINE',SYNC_NEEDED=>'SYNC NEEDED',SYNC_FAILURE=>'SYNC FAILURE',REPOSITORY_MISMATCH=>'REPOSITORY MISMATCH',FAILED_REDIRECT=>'REDIRECT FAILED');return$labels{$type}||event_label($type) }
+sub visual_event { my($event)=@_;my$label=timeline_label($event->{type});if($event->{type}eq'MASTER_CHANGE'){my$node=node_from_text($event->{peer});$label=defined$node?"MASTER=N$node":$label}my$time=timeline_time($event->{timestamp});$time=~s/^\d{4}-\d{2}-\d{2}\s+//;return"$time $label" }
 
 sub print_progress {
     my ($completed, $total, $elapsed) = @_;
